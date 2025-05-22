@@ -3,7 +3,7 @@
 # Cách sử dụng: sudo ./setup_portpanel.sh [PANEL_PORT]
 set -euo pipefail
 
-PANEL_PORT="${1:-9300}"
+PANEL_PORT="${1:-8080}"
 APP_DIR="/opt/portpanel"
 NODE_VERSION="18.x"
 
