@@ -104,7 +104,8 @@ func main() {
     for _, r := range rules { if r.Active { applyRule(r) } }
 
     mux := http.NewServeMux()
-    mux.Handle("/", http.FileServer(http.Dir("public")))
+    // Đây là route mới cho panel: /adminsetupfw/
+    mux.Handle("/adminsetupfw/", http.StripPrefix("/adminsetupfw/", http.FileServer(http.Dir("public"))))
 
     mux.HandleFunc("/api/rules", func(w http.ResponseWriter, r *http.Request) {
         mu.Lock(); defer mu.Unlock()
@@ -152,7 +153,7 @@ func main() {
         http.Error(w, "Method not allowed", 405)
     })
 
-    log.Printf("GoPortPanel đang chạy tại http://0.0.0.0:%d/\n", port)
+    log.Printf("GoPortPanel đang chạy tại http://0.0.0.0:%d/adminsetupfw/\n", port)
     http.ListenAndServe(fmt.Sprintf("0.0.0.0:%d", port), mux)
 }
 GO
@@ -414,4 +415,4 @@ iptables -I INPUT -p tcp --dport "$PANEL_PORT" -j ACCEPT || true
 iptables-save > /etc/iptables/rules.v4
 
 IP=$(curl -s4 https://api.ipify.org)
-echo "==> HOÀN TẤT! Truy cập Panel: http://$IP:$PANEL_PORT/"
+echo "==> HOÀN TẤT! Truy cập Panel: http://$IP:$PANEL_PORT/adminsetupfw/"
