@@ -104,7 +104,7 @@ func main() {
     for _, r := range rules { if r.Active { applyRule(r) } }
 
     mux := http.NewServeMux()
-    // Đây là route mới cho panel: /adminsetupfw/
+    // Serve UI panel tại /adminsetupfw/
     mux.Handle("/adminsetupfw/", http.StripPrefix("/adminsetupfw/", http.FileServer(http.Dir("public"))))
 
     mux.HandleFunc("/api/rules", func(w http.ResponseWriter, r *http.Request) {
@@ -199,7 +199,7 @@ cat > "$APP_DIR/frontend/index.html" <<'HTML'
   </head>
   <body class="bg-light">
     <div id="app"></div>
-    <script type="module" src="/src/main.js"></script>
+    <script type="module" src="/adminsetupfw/src/main.js"></script>
   </body>
 </html>
 HTML
@@ -319,7 +319,7 @@ import vue from '@vitejs/plugin-vue'
 
 export default defineConfig({
   root: '.',
-  base: '/',
+  base: '/adminsetupfw/',   // Cố định base chuẩn cho build dưới subpath
   plugins: [vue()],
   build: { outDir: 'dist', emptyOutDir: true }
 })
