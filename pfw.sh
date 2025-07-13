@@ -104,7 +104,7 @@ func main() {
     for _, r := range rules { if r.Active { applyRule(r) } }
 
     mux := http.NewServeMux()
-    // Serve static cho /adminsetupfw/ và assets chuẩn không lỗi trắng
+    // CHUẨN – Serve cả /adminsetupfw/ và assets không lỗi trắng
     mux.Handle("/adminsetupfw/assets/", http.StripPrefix("/adminsetupfw/", http.FileServer(http.Dir("public"))))
     mux.Handle("/adminsetupfw/", http.StripPrefix("/adminsetupfw/", http.FileServer(http.Dir("public"))))
 
@@ -200,7 +200,8 @@ cat > "$APP_DIR/frontend/index.html" <<'HTML'
   </head>
   <body class="bg-light">
     <div id="app"></div>
-    <script type="module" src="/adminsetupfw/src/main.js"></script>
+    <!-- CHUẨN: không để /adminsetupfw/ ở src -->
+    <script type="module" src="/src/main.js"></script>
   </body>
 </html>
 HTML
@@ -320,7 +321,7 @@ import vue from '@vitejs/plugin-vue'
 
 export default defineConfig({
   root: '.',
-  base: '/adminsetupfw/',   // CHUẨN nhất cho subdir
+  base: '/adminsetupfw/',   // PHẢI để base này!
   plugins: [vue()],
   build: { outDir: 'dist', emptyOutDir: true }
 })
