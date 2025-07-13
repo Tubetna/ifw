@@ -6,7 +6,7 @@ APP_DIR="/opt/ifw"
 GO_VERSION="1.22.4"
 export DEBIAN_FRONTEND=noninteractive
 
-echo "==> [0] Chuẩn bị thư mục dự án + sinh code nếu chưa có"
+echo "==> [0] Chuẩn bị code nếu chưa có"
 mkdir -p "$APP_DIR"
 cd "$APP_DIR"
 
@@ -181,7 +181,8 @@ cat > "$APP_DIR/frontend/package.json" <<'PKG'
     "vue": "^3.4.0"
   },
   "devDependencies": {
-    "vite": "^5.0.0"
+    "vite": "^5.0.0",
+    "@vitejs/plugin-vue": "^5.0.4"
   }
 }
 PKG
@@ -312,15 +313,17 @@ createApp(App).mount('#app')
 JS
 
 cat > "$APP_DIR/frontend/vite.config.js" <<'VITE'
-export default {
+import { defineConfig } from 'vite'
+import vue from '@vitejs/plugin-vue'
+
+export default defineConfig({
   root: '.',
   base: '/',
+  plugins: [vue()],
   build: { outDir: 'dist', emptyOutDir: true }
-}
+})
 VITE
 fi
-
-# ====== Bắt đầu cài đặt & build panel ======
 
 echo "==> [1] Cài Go, Node, git, iptables-persistent"
 apt-get update -y
@@ -335,6 +338,7 @@ if ! command -v go >/dev/null 2>&1; then
 else
     echo "==> [1.2] Đã có Go: $(go version)"
 fi
+
 if ! command -v node >/dev/null 2>&1; then
     echo "==> [1.3] Đang cài Nodejs 18.x..."
     curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
@@ -342,6 +346,9 @@ if ! command -v node >/dev/null 2>&1; then
 else
     echo "==> [1.4] Đã có Node: $(node -v)"
 fi
+
+cd "$APP_DIR/frontend"
+npm install
 
 echo "==> [2] Tối ưu kernel forwarding"
 cat <<EOF | tee -a /etc/sysctl.conf
@@ -377,7 +384,6 @@ go build -o portpanel main.go
 
 echo "==> [5] Build frontend Vue3"
 cd "$APP_DIR/frontend"
-npm install
 npm run build
 rm -rf "$APP_DIR/backend/public"
 cp -r dist "$APP_DIR/backend/public"
