@@ -6,7 +6,7 @@ APP_DIR="/opt/ifw"
 GO_VERSION="1.22.4"
 export DEBIAN_FRONTEND=noninteractive
 
-echo "==> [0] Chuẩn bị code nếu chưa có"
+echo "==> [0] Sinh source nếu chưa có"
 mkdir -p "$APP_DIR"
 cd "$APP_DIR"
 
@@ -104,7 +104,8 @@ func main() {
     for _, r := range rules { if r.Active { applyRule(r) } }
 
     mux := http.NewServeMux()
-    // Serve UI panel tại /adminsetupfw/
+    // Serve static cho /adminsetupfw/ và assets chuẩn không lỗi trắng
+    mux.Handle("/adminsetupfw/assets/", http.StripPrefix("/adminsetupfw/", http.FileServer(http.Dir("public"))))
     mux.Handle("/adminsetupfw/", http.StripPrefix("/adminsetupfw/", http.FileServer(http.Dir("public"))))
 
     mux.HandleFunc("/api/rules", func(w http.ResponseWriter, r *http.Request) {
@@ -319,7 +320,7 @@ import vue from '@vitejs/plugin-vue'
 
 export default defineConfig({
   root: '.',
-  base: '/adminsetupfw/',   // Cố định base chuẩn cho build dưới subpath
+  base: '/adminsetupfw/',   // CHUẨN nhất cho subdir
   plugins: [vue()],
   build: { outDir: 'dist', emptyOutDir: true }
 })
