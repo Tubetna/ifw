@@ -1,44 +1,17 @@
 #!/usr/bin/env bash
-# Go+Vue3 PortPanel tối ưu forwarding TCP+UDP - không anti-ddos, chỉ hiệu suất!
-
 set -euo pipefail
 
 PANEL_PORT="${1:-2020}"
-APP_DIR="/opt/goportpanel"
+APP_DIR="/opt/ifw"
 GO_VERSION="1.22.4"
+export DEBIAN_FRONTEND=noninteractive
 
-echo "==> [0] Cài Go, Node, git, iptables-persistent"
-apt-get update -y
-apt-get install -y curl git iptables-persistent build-essential ethtool
-
-echo "==> [1] Tối ưu kernel forwarding"
-cat <<EOF | tee -a /etc/sysctl.conf
-net.ipv4.ip_forward=1
-net.core.rmem_max=67108864
-net.core.wmem_max=67108864
-net.core.netdev_max_backlog=32768
-net.ipv4.tcp_rmem=4096 87380 67108864
-net.ipv4.tcp_wmem=4096 65536 67108864
-net.ipv4.udp_rmem_min=65536
-net.ipv4.udp_wmem_min=65536
-net.ipv4.tcp_fin_timeout=7
-net.ipv4.tcp_tw_reuse=1
-net.ipv4.tcp_max_syn_backlog=8192
-net.ipv4.tcp_mtu_probing=1
-EOF
-sysctl -p
-
-echo "==> [2] Tối ưu card mạng (nếu hỗ trợ)"
-ethtool -K eth0 gro off gso off tso off || true
-
-echo "==> [3] Tạo project code"
-rm -rf "$APP_DIR"
-mkdir -p "$APP_DIR/backend"
-mkdir -p "$APP_DIR/frontend/src"
+echo "==> [0] Chuẩn bị thư mục dự án + sinh code nếu chưa có"
+mkdir -p "$APP_DIR"
 cd "$APP_DIR"
 
-echo "==> [4] Sinh source code backend Go"
-cat > "$APP_DIR/backend/main.go" <<'GO'
+if [ ! -d backend ]; then
+cat > "$APP_DIR/backend.go" <<'GO'
 package main
 
 import (
@@ -184,15 +157,21 @@ func main() {
 }
 GO
 
+mkdir -p "$APP_DIR/backend"
+mv backend.go "$APP_DIR/backend/main.go"
+
 cat > "$APP_DIR/backend/go.mod" <<'GOMOD'
-module goportpanel
+module ifw
 go 1.22
 GOMOD
 
-echo "==> [5] Sinh source code frontend Vue3 (Vite)"
+fi
+
+if [ ! -d frontend ]; then
+mkdir -p "$APP_DIR/frontend/src"
 cat > "$APP_DIR/frontend/package.json" <<'PKG'
 {
-  "name": "goportpanel-ui",
+  "name": "ifw-ui",
   "version": "1.0.0",
   "scripts": {
     "dev": "vite",
@@ -213,7 +192,7 @@ cat > "$APP_DIR/frontend/index.html" <<'HTML'
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>GoPortPanel - Port Forward Panel</title>
+    <title>IFW PortPanel</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
   </head>
   <body class="bg-light">
@@ -226,7 +205,7 @@ HTML
 cat > "$APP_DIR/frontend/src/App.vue" <<'VUE'
 <template>
   <div class="container py-5">
-    <h1 class="mb-4 text-center">GoPortPanel - Bảng điều khiển Forwarding</h1>
+    <h1 class="mb-4 text-center">IFW - Bảng điều khiển Forwarding</h1>
     <div class="card mb-4 shadow-sm">
       <div class="card-body">
         <form @submit.prevent="addRule" class="row g-3">
@@ -339,29 +318,79 @@ export default {
   build: { outDir: 'dist', emptyOutDir: true }
 }
 VITE
+fi
 
-echo "==> [6] Build backend Go"
+# ====== Bắt đầu cài đặt & build panel ======
+
+echo "==> [1] Cài Go, Node, git, iptables-persistent"
+apt-get update -y
+apt-get install -y curl git iptables-persistent build-essential
+
+if ! command -v go >/dev/null 2>&1; then
+    echo "==> [1.1] Đang cài Go $GO_VERSION..."
+    rm -rf /usr/local/go
+    curl -sL https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz | tar -xz -C /usr/local
+    export PATH="/usr/local/go/bin:$PATH"
+    echo 'export PATH="/usr/local/go/bin:$PATH"' >> /root/.profile
+else
+    echo "==> [1.2] Đã có Go: $(go version)"
+fi
+if ! command -v node >/dev/null 2>&1; then
+    echo "==> [1.3] Đang cài Nodejs 18.x..."
+    curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
+    apt-get install -y nodejs
+else
+    echo "==> [1.4] Đã có Node: $(node -v)"
+fi
+
+echo "==> [2] Tối ưu kernel forwarding"
+cat <<EOF | tee -a /etc/sysctl.conf
+net.ipv4.ip_forward=1
+net.core.rmem_max=67108864
+net.core.wmem_max=67108864
+net.core.netdev_max_backlog=32768
+net.ipv4.tcp_rmem=4096 87380 67108864
+net.ipv4.tcp_wmem=4096 65536 67108864
+net.ipv4.udp_rmem_min=65536
+net.ipv4.udp_wmem_min=65536
+net.ipv4.tcp_fin_timeout=7
+net.ipv4.tcp_tw_reuse=1
+net.ipv4.tcp_max_syn_backlog=8192
+net.ipv4.tcp_mtu_probing=1
+EOF
+sysctl -p
+
+echo "==> [3] Tối ưu card mạng (tự nhận interface)"
+if ! command -v ethtool >/dev/null 2>&1; then apt-get install -y ethtool; fi
+NETDEV=$(ip -o link show | awk -F': ' '!/lo|vir|docker/ {print $2}' | head -n1 || true)
+if [[ -n "$NETDEV" ]]; then
+    ethtool -K "$NETDEV" gro off gso off tso off || true
+    echo "==> Đã tối ưu offload cho $NETDEV"
+else
+    echo "==> Không tìm thấy card vật lý (bỏ qua offload)"
+fi
+
+echo "==> [4] Build backend Go"
 cd "$APP_DIR/backend"
 go mod tidy
 go build -o portpanel main.go
 
-echo "==> [7] Build frontend Vue3"
+echo "==> [5] Build frontend Vue3"
 cd "$APP_DIR/frontend"
 npm install
 npm run build
 rm -rf "$APP_DIR/backend/public"
 cp -r dist "$APP_DIR/backend/public"
 
-echo "==> [8] Tạo systemd service"
-cat > /etc/systemd/system/goportpanel.service <<EOF
+echo "==> [6] Tạo systemd service"
+cat > /etc/systemd/system/ifw.service <<EOF
 [Unit]
-Description=Go Port Forward Panel
+Description=IFW PortPanel
 After=network.target
 
 [Service]
-Environment=PANEL_PORT=$PANEL_PORT
 WorkingDirectory=$APP_DIR/backend
-ExecStart=$APP_DIR/backend/portpanel --port \$PANEL_PORT
+ExecStart=$APP_DIR/backend/portpanel --port $PANEL_PORT
 Restart=on-failure
 User=root
 
@@ -370,12 +399,12 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now goportpanel.service
+systemctl enable --now ifw.service
 
-echo "==> [9] Bật IP forwarding & mở firewall"
+echo "==> [7] Mở forwarding, firewall"
 sysctl -w net.ipv4.ip_forward=1
 iptables -P FORWARD ACCEPT
-iptables -I INPUT -p tcp --dport "$PANEL_PORT" -j ACCEPT
+iptables -I INPUT -p tcp --dport "$PANEL_PORT" -j ACCEPT || true
 iptables-save > /etc/iptables/rules.v4
 
 IP=$(curl -s4 https://api.ipify.org)
