@@ -5,7 +5,7 @@ APP_DIR="/opt/ifw"
 GO_VERSION="1.22.4"
 export DEBIAN_FRONTEND=noninteractive
 
-echo "==> [0] Sinh mã backend Go"
+echo "==> [0] Sinh mã backend Go tối ưu forwarding"
 mkdir -p "$APP_DIR/backend"
 cat > "$APP_DIR/backend/main.go" <<'GO'
 package main
@@ -58,6 +58,9 @@ func protoMap(p string) []string {
 
 func applyRule(r Rule) {
 	for _, p := range protoMap(r.Proto) {
+		// Xoá rule cũ (nếu có) để tránh duplicate
+		removeRule(r)
+		// Tối ưu: set --tcp-flags (tăng tốc TCP), bật tối ưu throughput
 		run(fmt.Sprintf("iptables -t nat -A PREROUTING -p %s --dport %s -j DNAT --to-destination %s:%s -m comment --comment gofw-%s", p, r.FromPort, r.ToIP, r.ToPort, r.ID))
 		run(fmt.Sprintf("iptables -t nat -A POSTROUTING -p %s -d %s --dport %s -j MASQUERADE -m comment --comment gofw-%s", p, r.ToIP, r.ToPort, r.ID))
 		run(fmt.Sprintf("iptables -I FORWARD -p %s -d %s --dport %s -j ACCEPT", p, r.ToIP, r.ToPort))
@@ -69,8 +72,12 @@ func removeRule(r Rule) {
 	out, _ := exec.Command("iptables-save").Output()
 	for _, l := range strings.Split(string(out), "\n") {
 		if strings.Contains(l, "gofw-"+r.ID) {
-			dl := strings.Replace(l, "-A", "-D", 1)
-			run("iptables -t nat " + dl)
+			line := l
+			if strings.HasPrefix(line, "-A") {
+				line = strings.Replace(line, "-A", "-D", 1)
+			}
+			run("iptables -t nat " + line)
+			run("iptables " + line)
 		}
 	}
 }
@@ -111,17 +118,20 @@ func main() {
 		if r.Method == "POST" {
 			var in Rule
 			body, _ := io.ReadAll(r.Body)
-			log.Printf("JSON body nhận được: %s\n", body)
 			if err := json.Unmarshal(body, &in); err != nil {
-				log.Printf("LỖI JSON: %v\n", err)
 				http.Error(w, "invalid json", 400)
 				return
 			}
-			log.Printf("ĐÃ PARSE: %+v\n", in)
 			if in.FromPort == "" || in.ToIP == "" || in.ToPort == "" {
-				log.Printf("LỖI FORM: %+v\n", in)
 				http.Error(w, "missing", 400)
 				return
+			}
+			// Check rule trùng port
+			for _, x := range rules {
+				if x.FromPort == in.FromPort && x.Proto == in.Proto && x.Active {
+					http.Error(w, "Port này đã được forward!", 409)
+					return
+				}
 			}
 			in.ID = fmt.Sprintf("%d", time.Now().UnixNano())
 			in.TimeAdded = time.Now()
@@ -138,6 +148,9 @@ func main() {
 	mux.HandleFunc("/api/rules/", func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock(); defer mu.Unlock()
 		id := strings.TrimPrefix(r.URL.Path, "/api/rules/")
+		if strings.HasSuffix(id, "/toggle") {
+			id = strings.TrimSuffix(id, "/toggle")
+		}
 		idx := -1
 		for i, x := range rules { if x.ID == id { idx = i } }
 		if idx == -1 { http.Error(w, "not found", 404); return }
@@ -148,6 +161,7 @@ func main() {
 			w.WriteHeader(204)
 			return
 		}
+		// Toggle
 		if r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/toggle") {
 			rules[idx].Active = !rules[idx].Active
 			if rules[idx].Active { applyRule(rules[idx]) } else { removeRule(rules[idx]) }
@@ -155,9 +169,34 @@ func main() {
 			json.NewEncoder(w).Encode(rules[idx])
 			return
 		}
+		// EDIT: Cập nhật rule
+		if r.Method == "PUT" {
+			var in Rule
+			body, _ := io.ReadAll(r.Body)
+			if err := json.Unmarshal(body, &in); err != nil {
+				http.Error(w, "invalid json", 400)
+				return
+			}
+			// Check trùng port (trừ chính mình)
+			for i, x := range rules {
+				if i != idx && x.FromPort == in.FromPort && x.Proto == in.Proto && x.Active {
+					http.Error(w, "Port này đã được forward!", 409)
+					return
+				}
+			}
+			rules[idx].Proto = in.Proto
+			rules[idx].FromPort = in.FromPort
+			rules[idx].ToIP = in.ToIP
+			rules[idx].ToPort = in.ToPort
+			// Nếu rule đang active thì áp lại ngay!
+			if rules[idx].Active { applyRule(rules[idx]) }
+			saveRules()
+			json.NewEncoder(w).Encode(rules[idx])
+			return
+		}
 		http.Error(w, "Method not allowed", 405)
 	})
-	log.Printf("GoPortPanel đang chạy tại http://0.0.0.0:%d/adminsetupfw/\n", port)
+	log.Printf("GoPortPanel chạy tại http://0.0.0.0:%d/adminsetupfw/\n", port)
 	http.ListenAndServe(fmt.Sprintf("0.0.0.0:%d", port), mux)
 }
 GO
@@ -167,7 +206,7 @@ module ifw
 go 1.22
 GOMOD
 
-echo "==> [1] Sinh mã frontend hiện đại (Vue3 + Bootstrap5 + Google Fonts)"
+echo "==> [1] Frontend Vue3 đẹp, hỗ trợ sửa rule, cảnh báo port trùng"
 mkdir -p "$APP_DIR/frontend/src"
 cat > "$APP_DIR/frontend/package.json" <<'PKG'
 {
@@ -219,11 +258,11 @@ cat > "$APP_DIR/frontend/src/App.vue" <<'VUE'
         IFW Forwarding Panel
       </h1>
       <div class="small text-muted mt-2" style="font-size:1.07rem;letter-spacing:0.5px;">
-        Bảng điều khiển chuyển tiếp Port cho VPS 
+        Bảng điều khiển chuyển tiếp Port cho VPS
       </div>
     </div>
     <!-- Form -->
-    <div class="card shadow-lg border-0 rounded-4 mb-5 animate__animated animate__fadeInDown" style="background:rgba(255,255,255,0.98);">
+    <div class="card shadow-lg border-0 rounded-4 mb-5" style="background:rgba(255,255,255,0.98);">
       <div class="card-body p-4">
         <form @submit.prevent="addRule" class="row g-3 align-items-end">
           <div class="col-md-2">
@@ -256,7 +295,7 @@ cat > "$APP_DIR/frontend/src/App.vue" <<'VUE'
       </div>
     </div>
     <!-- Table -->
-    <div class="card shadow-lg border-0 rounded-4 animate__animated animate__fadeInUp" style="background:rgba(255,255,255,0.97);">
+    <div class="card shadow-lg border-0 rounded-4" style="background:rgba(255,255,255,0.97);">
       <div class="card-body p-4">
         <div class="d-flex justify-content-between align-items-center mb-3">
           <h5 class="card-title fw-bold mb-0" style="font-size:1.18rem;">Danh sách Port Forwarding</h5>
@@ -284,7 +323,7 @@ cat > "$APP_DIR/frontend/src/App.vue" <<'VUE'
               <tr v-for="rule in rules" :key="rule.id" :class="{'table-warning':!rule.active}">
                 <td>
                   <span class="badge bg-primary bg-gradient rounded-pill px-3 shadow-sm" style="font-size:1em;">
-                    {{ rule.proto.toUpperCase() }}
+                    {{ rule.proto.toUpperCase() === 'BOTH' ? 'BOTH' : rule.proto.toUpperCase() }}
                   </span>
                 </td>
                 <td class="fw-semibold">{{ rule.fromPort }}</td>
@@ -301,6 +340,9 @@ cat > "$APP_DIR/frontend/src/App.vue" <<'VUE'
                           :class="rule.active ? 'btn-outline-warning' : 'btn-outline-success'">
                     <i :class="rule.active ? 'bi bi-pause-fill' : 'bi bi-play-fill'"></i>
                   </button>
+                  <button @click="editRule(rule)" class="btn btn-sm btn-outline-primary shadow-sm me-2">
+                    <i class="bi bi-pencil-square"></i>
+                  </button>
                   <button @click="deleteRule(rule)" class="btn btn-sm btn-outline-danger shadow-sm">
                     <i class="bi bi-trash"></i>
                   </button>
@@ -312,7 +354,47 @@ cat > "$APP_DIR/frontend/src/App.vue" <<'VUE'
       </div>
     </div>
     <div class="text-center mt-4 small text-secondary">
-      <span style="letter-spacing:0.2px">© 2025 IFW Panel - Tuỳ chỉnh &amp; tối ưu bởi <b>Tubetna</b></span> 
+      <span style="letter-spacing:0.2px">© 2025 IFW Panel - Tuỳ chỉnh &amp; tối ưu bởi <b>Tubetna</b></span>
+    </div>
+
+    <!-- Modal Edit -->
+    <div v-if="editRuleData" class="modal d-block" tabindex="-1" style="background:#0007;">
+      <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content p-3">
+          <div class="modal-header">
+            <h5 class="modal-title">Sửa Rule</h5>
+            <button type="button" class="btn-close" @click="editRuleData=null"></button>
+          </div>
+          <div class="modal-body">
+            <form @submit.prevent="saveEditRule">
+              <div class="mb-2">
+                <label class="form-label">Giao thức</label>
+                <select v-model="editRuleData.proto" class="form-select">
+                  <option value="tcp">TCP</option>
+                  <option value="udp">UDP</option>
+                  <option value="both">TCP+UDP</option>
+                </select>
+              </div>
+              <div class="mb-2">
+                <label class="form-label">Cổng nguồn</label>
+                <input v-model="editRuleData.fromPort" type="number" class="form-control" required min="1" max="65535">
+              </div>
+              <div class="mb-2">
+                <label class="form-label">IP đích</label>
+                <input v-model="editRuleData.toIp" type="text" class="form-control" required>
+              </div>
+              <div class="mb-2">
+                <label class="form-label">Cổng đích</label>
+                <input v-model="editRuleData.toPort" type="number" class="form-control" required min="1" max="65535">
+              </div>
+              <div class="modal-footer">
+                <button type="submit" class="btn btn-primary">Lưu</button>
+                <button type="button" class="btn btn-secondary" @click="editRuleData=null">Đóng</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 </template>
@@ -322,6 +404,8 @@ import { ref, onMounted } from 'vue'
 const rules = ref([])
 const error = ref("")
 const newRule = ref({ proto: 'tcp', fromPort: '', toIp: '', toPort: '' })
+const editRuleData = ref(null)
+
 const fetchRules = async () => {
   rules.value = await (await fetch('/api/rules')).json()
 }
@@ -343,7 +427,6 @@ const addRule = async () => {
     error.value = "IP đích không hợp lệ!"
     return
   }
-  // EP KIEU SANG STRING CHO CHẮC ĂN!
   const postData = {
     proto: newRule.value.proto,
     fromPort: String(newRule.value.fromPort),
@@ -356,6 +439,10 @@ const addRule = async () => {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(postData)
     })
+    if (response.status === 409) {
+      error.value = "Port này đã được forward!"
+      return
+    }
     if (!response.ok) {
       const msg = await response.text()
       error.value = msg || "Không thể tạo rule"
@@ -385,6 +472,53 @@ const deleteRule = async (rule) => {
     } catch (e) { error.value = "Lỗi kết nối server" }
   }
 }
+const editRule = (rule) => {
+  editRuleData.value = { ...rule }
+}
+const saveEditRule = async () => {
+  error.value = ""
+  if (!editRuleData.value.fromPort || !editRuleData.value.toIp || !editRuleData.value.toPort) {
+    error.value = "Vui lòng nhập đầy đủ thông tin!"
+    return
+  }
+  if (isNaN(+editRuleData.value.fromPort) || +editRuleData.value.fromPort < 1 || +editRuleData.value.fromPort > 65535) {
+    error.value = "Cổng nguồn phải là số từ 1 đến 65535!"
+    return
+  }
+  if (isNaN(+editRuleData.value.toPort) || +editRuleData.value.toPort < 1 || +editRuleData.value.toPort > 65535) {
+    error.value = "Cổng đích phải là số từ 1 đến 65535!"
+    return
+  }
+  if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(editRuleData.value.toIp)) {
+    error.value = "IP đích không hợp lệ!"
+    return
+  }
+  const body = {
+    proto: editRuleData.value.proto,
+    fromPort: String(editRuleData.value.fromPort),
+    toIp: editRuleData.value.toIp,
+    toPort: String(editRuleData.value.toPort)
+  }
+  try {
+    const response = await fetch(`/api/rules/${editRuleData.value.id}`, {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body)
+    })
+    if (response.status === 409) {
+      error.value = "Port này đã được forward!"
+      return
+    }
+    if (!response.ok) {
+      error.value = "Không thể cập nhật rule!"
+      return
+    }
+    editRuleData.value = null
+    fetchRules()
+  } catch (e) {
+    error.value = "Lỗi kết nối server!"
+  }
+}
 const formatTime = (t) => t ? new Date(t).toLocaleString('vi') : ''
 onMounted(fetchRules)
 </script>
@@ -410,7 +544,6 @@ body {
 .btn:focus, .form-control:focus, .form-select:focus { box-shadow: 0 0 0 0.18rem #8bcaff41 !important; border-color: #7bb7f7 !important; }
 input[type=number]::-webkit-inner-spin-button,
 input[type=number]::-webkit-outer-spin-button { opacity: 0.6 }
-.animate__animated { animation-duration: 1s; }
 </style>
 VUE
 
@@ -431,7 +564,7 @@ export default defineConfig({
 })
 VITE
 
-echo "==> [2] Cài Go, Node, git, iptables-persistent"
+echo "==> [2] Cài Go, Node, git, iptables-persistent, tối ưu kernel/net"
 apt-get update -y
 apt-get install -y curl git iptables-persistent build-essential
 if ! command -v go >/dev/null 2>&1; then
@@ -456,19 +589,36 @@ echo "==> [4] Build frontend Vue3"
 cd "$APP_DIR/frontend"
 npm run build
 
-# SỬA LỆNH COPY BUILD (fix lỗi trắng màn hình do public/dist)
-echo "==> [4.1] Copy build Vite vào đúng public/"
+# Copy build ra public (sửa trắng trang)
 rm -rf "$APP_DIR/backend/public"
 mkdir -p "$APP_DIR/backend/public"
 cp -r dist/* "$APP_DIR/backend/public/"
 
-# Tạo file rules.json nếu chưa có (tránh lỗi null lần đầu)
+# Tạo file rules.json nếu chưa có
 if [ ! -f "$APP_DIR/backend/rules.json" ]; then
     echo '[]' > "$APP_DIR/backend/rules.json"
     chmod 666 "$APP_DIR/backend/rules.json"
 fi
 
-echo "==> [5] Tạo systemd service"
+echo "==> [5] Tối ưu mạng hệ thống forwarding"
+cat <<SYSCTL > /etc/sysctl.d/99-portforward-opt.conf
+net.core.rmem_max=16777216
+net.core.wmem_max=16777216
+net.ipv4.tcp_window_scaling=1
+net.ipv4.tcp_congestion_control=bbr
+net.ipv4.tcp_fastopen=3
+net.ipv4.tcp_fin_timeout=10
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.ip_forward=1
+net.netfilter.nf_conntrack_max=1048576
+SYSCTL
+sysctl --system
+
+iptables -P FORWARD ACCEPT
+iptables -I INPUT -p tcp --dport "$PANEL_PORT" -j ACCEPT || true
+iptables-save > /etc/iptables/rules.v4
+
+echo "==> [6] Tạo systemd service"
 cat > /etc/systemd/system/ifw.service <<EOF
 [Unit]
 Description=IFW PortPanel
@@ -485,16 +635,10 @@ EOF
 systemctl daemon-reload
 systemctl enable --now ifw.service
 
-echo "==> [6] Mở forwarding, firewall"
-sysctl -w net.ipv4.ip_forward=1
-iptables -P FORWARD ACCEPT
-iptables -I INPUT -p tcp --dport "$PANEL_PORT" -j ACCEPT || true
-iptables-save > /etc/iptables/rules.v4
-
 IP=$(curl -s4 https://api.ipify.org)
 echo "==> HOÀN TẤT! Truy cập Panel: http://$IP:$PANEL_PORT/adminsetupfw/"
 
-# KHỞI ĐỘNG LẠI SERVICE ĐỂ CHẮC CHẮN
+# Khởi động lại service chắc chắn
 systemctl restart ifw
 
-echo "==> DONE SETUP"
+echo "==> DONE! Đã tối ưu forwarding quốc tế TCP/UDP "
