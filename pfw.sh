@@ -6,16 +6,15 @@ APP_DIR="/opt/ifw"
 GO_VERSION="1.22.4"
 export DEBIAN_FRONTEND=noninteractive
 
-echo "==> [0] Sinh source nếu chưa có"
-mkdir -p "$APP_DIR"
-cd "$APP_DIR"
-
-if [ ! -d backend ]; then
-cat > "$APP_DIR/backend.go" <<'GO'
+echo "==> [0] Generate backend code"
+mkdir -p "$APP_DIR/backend"
+cat > "$APP_DIR/backend/main.go" <<'GO'
 package main
 
 import (
     "encoding/json"
+    "fmt"
+    "io"
     "log"
     "net/http"
     "os"
@@ -24,7 +23,6 @@ import (
     "sync"
     "time"
     "flag"
-    "fmt"
     "strings"
 )
 
@@ -104,7 +102,6 @@ func main() {
     for _, r := range rules { if r.Active { applyRule(r) } }
 
     mux := http.NewServeMux()
-    // CHUẨN – Serve cả /adminsetupfw/ và assets không lỗi trắng
     mux.Handle("/adminsetupfw/assets/", http.StripPrefix("/adminsetupfw/", http.FileServer(http.Dir("public"))))
     mux.Handle("/adminsetupfw/", http.StripPrefix("/adminsetupfw/", http.FileServer(http.Dir("public"))))
 
@@ -117,14 +114,26 @@ func main() {
         }
         if r.Method == "POST" {
             var in Rule
-            json.NewDecoder(r.Body).Decode(&in)
-            if in.FromPort == "" || in.ToIP == "" || in.ToPort == "" { http.Error(w, "missing", 400); return }
+            body, _ := io.ReadAll(r.Body)
+            log.Printf("JSON body nhận được: %s\n", body)
+            if err := json.Unmarshal(body, &in); err != nil {
+                log.Printf("LỖI JSON: %v\n", err)
+                http.Error(w, "invalid json", 400)
+                return
+            }
+            log.Printf("ĐÃ PARSE: %+v\n", in)
+            if in.FromPort == "" || in.ToIP == "" || in.ToPort == "" {
+                log.Printf("LỖI FORM: %+v\n", in)
+                http.Error(w, "missing", 400)
+                return
+            }
             in.ID = fmt.Sprintf("%d", time.Now().UnixNano())
             in.TimeAdded = time.Now()
             in.Active = true
             rules = append(rules, in)
             applyRule(in)
             saveRules()
+            w.Header().Set("Content-Type", "application/json")
             json.NewEncoder(w).Encode(in)
             return
         }
@@ -159,17 +168,12 @@ func main() {
 }
 GO
 
-mkdir -p "$APP_DIR/backend"
-mv backend.go "$APP_DIR/backend/main.go"
-
 cat > "$APP_DIR/backend/go.mod" <<'GOMOD'
 module ifw
 go 1.22
 GOMOD
 
-fi
-
-if [ ! -d frontend ]; then
+echo "==> [1] Generate frontend code"
 mkdir -p "$APP_DIR/frontend/src"
 cat > "$APP_DIR/frontend/package.json" <<'PKG'
 {
@@ -200,7 +204,6 @@ cat > "$APP_DIR/frontend/index.html" <<'HTML'
   </head>
   <body class="bg-light">
     <div id="app"></div>
-    <!-- CHUẨN: không để /adminsetupfw/ ở src -->
     <script type="module" src="/src/main.js"></script>
   </body>
 </html>
@@ -208,43 +211,45 @@ HTML
 
 cat > "$APP_DIR/frontend/src/App.vue" <<'VUE'
 <template>
-  <div class="container py-5">
-    <h1 class="mb-4 text-center">IFW - Bảng điều khiển Forwarding</h1>
-    <div class="card mb-4 shadow-sm">
+  <div class="container py-5" style="max-width: 900px;">
+    <h1 class="mb-4 text-center fw-bold" style="font-size:2.6rem;letter-spacing:1px;color:#1064ea;">IFW - Bảng điều khiển Forwarding</h1>
+    <div class="card mb-4 shadow rounded-4 border-0">
       <div class="card-body">
-        <form @submit.prevent="addRule" class="row g-3">
+        <form @submit.prevent="addRule" class="row g-3 align-items-end">
           <div class="col-md-2">
-            <label class="form-label">Giao thức</label>
-            <select v-model="newRule.proto" class="form-select">
+            <label class="form-label fw-semibold">Giao thức</label>
+            <select v-model="newRule.proto" class="form-select rounded-3 border-1 shadow-sm">
               <option value="tcp">TCP</option>
               <option value="udp">UDP</option>
               <option value="both">TCP+UDP</option>
             </select>
           </div>
           <div class="col-md-3">
-            <label class="form-label">Cổng nguồn</label>
-            <input v-model="newRule.fromPort" type="number" class="form-control" required>
+            <label class="form-label fw-semibold">Cổng nguồn</label>
+            <input v-model="newRule.fromPort" type="number" min="1" max="65535" class="form-control rounded-3 border-1 shadow-sm" required>
           </div>
           <div class="col-md-3">
-            <label class="form-label">IP đích</label>
-            <input v-model="newRule.toIp" type="text" class="form-control" required>
+            <label class="form-label fw-semibold">IP đích</label>
+            <input v-model="newRule.toIp" type="text" class="form-control rounded-3 border-1 shadow-sm" required pattern="^\\d{1,3}(\\.\\d{1,3}){3}$">
           </div>
           <div class="col-md-2">
-            <label class="form-label">Cổng đích</label>
-            <input v-model="newRule.toPort" type="number" class="form-control" required>
+            <label class="form-label fw-semibold">Cổng đích</label>
+            <input v-model="newRule.toPort" type="number" min="1" max="65535" class="form-control rounded-3 border-1 shadow-sm" required>
           </div>
-          <div class="col-md-2 d-flex align-items-end">
-            <button type="submit" class="btn btn-primary w-100">Lưu</button>
+          <div class="col-md-2 d-grid">
+            <button type="submit" class="btn btn-primary rounded-3 shadow-sm fw-bold" style="font-size:1.12rem;">Lưu</button>
           </div>
         </form>
+        <div v-if="error" class="alert alert-danger mt-3 py-2 px-3 rounded-3" role="alert">{{ error }}</div>
       </div>
     </div>
-    <div class="card shadow-sm">
+
+    <div class="card shadow rounded-4 border-0">
       <div class="card-body">
-        <h5 class="card-title">Danh sách chuyển tiếp</h5>
+        <h5 class="card-title fw-bold mb-3" style="font-size:1.18rem;">Danh sách chuyển tiếp</h5>
         <div class="table-responsive">
-          <table class="table table-hover align-middle">
-            <thead>
+          <table class="table align-middle table-hover mb-0" style="font-size:1.06rem;">
+            <thead class="table-light">
               <tr>
                 <th>Giao thức</th>
                 <th>Cổng VPS</th>
@@ -256,19 +261,22 @@ cat > "$APP_DIR/frontend/src/App.vue" <<'VUE'
               </tr>
             </thead>
             <tbody>
+              <tr v-if="rules.length === 0">
+                <td colspan="7" class="text-center text-muted">Chưa có rule nào</td>
+              </tr>
               <tr v-for="rule in rules" :key="rule.id">
-                <td>{{ rule.proto.toUpperCase() }}</td>
+                <td><span class="badge bg-gradient text-bg-primary" style="font-size:1em;">{{ rule.proto.toUpperCase() }}</span></td>
                 <td>{{ rule.fromPort }}</td>
                 <td>{{ rule.toIp }}</td>
                 <td>{{ rule.toPort }}</td>
                 <td>{{ formatTime(rule.timeAdded) }}</td>
                 <td>
-                  <span class="badge" :class="rule.active ? 'bg-success' : 'bg-secondary'">
+                  <span class="badge rounded-pill" :class="rule.active ? 'bg-success' : 'bg-secondary'">
                     {{ rule.active ? 'Hoạt động' : 'Tạm dừng' }}
                   </span>
                 </td>
                 <td>
-                  <button @click="toggleRule(rule)" class="btn btn-sm" :class="rule.active ? 'btn-warning' : 'btn-success'">
+                  <button @click="toggleRule(rule)" class="btn btn-sm me-2" :class="rule.active ? 'btn-warning' : 'btn-success'">
                     {{ rule.active ? 'Tạm dừng' : 'Kích hoạt' }}
                   </button>
                   <button @click="deleteRule(rule)" class="btn btn-sm btn-danger">Xóa</button>
@@ -285,28 +293,82 @@ cat > "$APP_DIR/frontend/src/App.vue" <<'VUE'
 <script setup>
 import { ref, onMounted } from 'vue'
 const rules = ref([])
+const error = ref("")
 const newRule = ref({ proto: 'tcp', fromPort: '', toIp: '', toPort: '' })
 
 const fetchRules = async () => {
   rules.value = await (await fetch('/api/rules')).json()
 }
+
 const addRule = async () => {
-  await fetch('/api/rules', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(newRule.value)})
-  newRule.value = { proto: 'tcp', fromPort: '', toIp: '', toPort: '' }
-  fetchRules()
+  error.value = ""
+  if (!newRule.value.fromPort || !newRule.value.toIp || !newRule.value.toPort) {
+    error.value = "Vui lòng nhập đầy đủ thông tin!"
+    return
+  }
+  if (isNaN(+newRule.value.fromPort) || +newRule.value.fromPort < 1 || +newRule.value.fromPort > 65535) {
+    error.value = "Cổng nguồn phải là số từ 1 đến 65535!"
+    return
+  }
+  if (isNaN(+newRule.value.toPort) || +newRule.value.toPort < 1 || +newRule.value.toPort > 65535) {
+    error.value = "Cổng đích phải là số từ 1 đến 65535!"
+    return
+  }
+  if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(newRule.value.toIp)) {
+    error.value = "IP đích không hợp lệ!"
+    return
+  }
+  try {
+    const response = await fetch('/api/rules', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(newRule.value)
+    })
+    if (!response.ok) {
+      const msg = await response.text()
+      error.value = msg || "Không thể tạo rule"
+      return
+    }
+    newRule.value = { proto: 'tcp', fromPort: '', toIp: '', toPort: '' }
+    fetchRules()
+  } catch (e) {
+    error.value = "Lỗi kết nối server"
+  }
 }
+
 const toggleRule = async (rule) => {
-  await fetch(`/api/rules/${rule.id}/toggle`, { method: 'POST' })
-  fetchRules()
+  error.value = ""
+  try {
+    const response = await fetch(`/api/rules/${rule.id}/toggle`, { method: 'POST' })
+    if (!response.ok) error.value = "Không thể cập nhật trạng thái rule"
+    fetchRules()
+  } catch (e) { error.value = "Lỗi kết nối server" }
 }
 const deleteRule = async (rule) => {
-  if(confirm('Bạn có chắc xóa rule này?'))
-    await fetch(`/api/rules/${rule.id}`, { method: 'DELETE' })
-    fetchRules()
+  error.value = ""
+  if(confirm('Bạn có chắc chắn muốn xóa rule này?')) {
+    try {
+      const response = await fetch(`/api/rules/${rule.id}`, { method: 'DELETE' })
+      if (!response.ok) error.value = "Không thể xóa rule"
+      fetchRules()
+    } catch (e) { error.value = "Lỗi kết nối server" }
+  }
 }
-const formatTime = (t) => new Date(t).toLocaleString('vi')
+const formatTime = (t) => t ? new Date(t).toLocaleString('vi') : ''
 onMounted(fetchRules)
 </script>
+
+<style>
+body {
+  background: #f6f8fb !important;
+}
+.table th, .table td { vertical-align: middle; }
+.card { border-radius: 1.2rem !important; }
+.badge.bg-gradient {
+  background: linear-gradient(90deg,#2697f2,#12b6e7) !important;
+  color: #fff;
+}
+</style>
 VUE
 
 cat > "$APP_DIR/frontend/src/main.js" <<'JS'
@@ -318,91 +380,51 @@ JS
 cat > "$APP_DIR/frontend/vite.config.js" <<'VITE'
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
-
 export default defineConfig({
   root: '.',
-  base: '/adminsetupfw/',   // PHẢI để base này!
+  base: '/adminsetupfw/',
   plugins: [vue()],
   build: { outDir: 'dist', emptyOutDir: true }
 })
 VITE
-fi
 
-echo "==> [1] Cài Go, Node, git, iptables-persistent"
+echo "==> [2] Cài Go, Node, git, iptables-persistent"
 apt-get update -y
 apt-get install -y curl git iptables-persistent build-essential
-
 if ! command -v go >/dev/null 2>&1; then
-    echo "==> [1.1] Đang cài Go $GO_VERSION..."
-    rm -rf /usr/local/go
     curl -sL https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz | tar -xz -C /usr/local
     export PATH="/usr/local/go/bin:$PATH"
     echo 'export PATH="/usr/local/go/bin:$PATH"' >> /root/.profile
-else
-    echo "==> [1.2] Đã có Go: $(go version)"
 fi
-
 if ! command -v node >/dev/null 2>&1; then
-    echo "==> [1.3] Đang cài Nodejs 18.x..."
     curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
     apt-get install -y nodejs
-else
-    echo "==> [1.4] Đã có Node: $(node -v)"
 fi
 
 cd "$APP_DIR/frontend"
 npm install
 
-echo "==> [2] Tối ưu kernel forwarding"
-cat <<EOF | tee -a /etc/sysctl.conf
-net.ipv4.ip_forward=1
-net.core.rmem_max=67108864
-net.core.wmem_max=67108864
-net.core.netdev_max_backlog=32768
-net.ipv4.tcp_rmem=4096 87380 67108864
-net.ipv4.tcp_wmem=4096 65536 67108864
-net.ipv4.udp_rmem_min=65536
-net.ipv4.udp_wmem_min=65536
-net.ipv4.tcp_fin_timeout=7
-net.ipv4.tcp_tw_reuse=1
-net.ipv4.tcp_max_syn_backlog=8192
-net.ipv4.tcp_mtu_probing=1
-EOF
-sysctl -p
-
-echo "==> [3] Tối ưu card mạng (tự nhận interface)"
-if ! command -v ethtool >/dev/null 2>&1; then apt-get install -y ethtool; fi
-NETDEV=$(ip -o link show | awk -F': ' '!/lo|vir|docker/ {print $2}' | head -n1 || true)
-if [[ -n "$NETDEV" ]]; then
-    ethtool -K "$NETDEV" gro off gso off tso off || true
-    echo "==> Đã tối ưu offload cho $NETDEV"
-else
-    echo "==> Không tìm thấy card vật lý (bỏ qua offload)"
-fi
-
-echo "==> [4] Build backend Go"
+echo "==> [3] Build backend Go"
 cd "$APP_DIR/backend"
 go mod tidy
 go build -o portpanel main.go
 
-echo "==> [5] Build frontend Vue3"
+echo "==> [4] Build frontend Vue3"
 cd "$APP_DIR/frontend"
 npm run build
 rm -rf "$APP_DIR/backend/public"
 cp -r dist "$APP_DIR/backend/public"
 
-echo "==> [6] Tạo systemd service"
+echo "==> [5] Tạo systemd service"
 cat > /etc/systemd/system/ifw.service <<EOF
 [Unit]
 Description=IFW PortPanel
 After=network.target
-
 [Service]
 WorkingDirectory=$APP_DIR/backend
 ExecStart=$APP_DIR/backend/portpanel --port $PANEL_PORT
 Restart=on-failure
 User=root
-
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -410,7 +432,7 @@ EOF
 systemctl daemon-reload
 systemctl enable --now ifw.service
 
-echo "==> [7] Mở forwarding, firewall"
+echo "==> [6] Mở forwarding, firewall"
 sysctl -w net.ipv4.ip_forward=1
 iptables -P FORWARD ACCEPT
 iptables -I INPUT -p tcp --dport "$PANEL_PORT" -j ACCEPT || true
