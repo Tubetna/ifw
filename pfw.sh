@@ -343,11 +343,18 @@ const addRule = async () => {
     error.value = "IP đích không hợp lệ!"
     return
   }
+  // EP KIEU SANG STRING CHO CHẮC ĂN!
+  const postData = {
+    proto: newRule.value.proto,
+    fromPort: String(newRule.value.fromPort),
+    toIp: newRule.value.toIp,
+    toPort: String(newRule.value.toPort)
+  }
   try {
     const response = await fetch('/api/rules', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(newRule.value)
+      body: JSON.stringify(postData)
     })
     if (!response.ok) {
       const msg = await response.text()
@@ -455,6 +462,12 @@ rm -rf "$APP_DIR/backend/public"
 mkdir -p "$APP_DIR/backend/public"
 cp -r dist/* "$APP_DIR/backend/public/"
 
+# Tạo file rules.json nếu chưa có (tránh lỗi null lần đầu)
+if [ ! -f "$APP_DIR/backend/rules.json" ]; then
+    echo '[]' > "$APP_DIR/backend/rules.json"
+    chmod 666 "$APP_DIR/backend/rules.json"
+fi
+
 echo "==> [5] Tạo systemd service"
 cat > /etc/systemd/system/ifw.service <<EOF
 [Unit]
@@ -477,11 +490,6 @@ sysctl -w net.ipv4.ip_forward=1
 iptables -P FORWARD ACCEPT
 iptables -I INPUT -p tcp --dport "$PANEL_PORT" -j ACCEPT || true
 iptables-save > /etc/iptables/rules.v4
-
-if [ ! -f "$APP_DIR/backend/rules.json" ]; then
-    echo '[]' > "$APP_DIR/backend/rules.json"
-    chmod 666 "$APP_DIR/backend/rules.json"
-fi
 
 IP=$(curl -s4 https://api.ipify.org)
 echo "==> HOÀN TẤT! Truy cập Panel: http://$IP:$PANEL_PORT/adminsetupfw/"
