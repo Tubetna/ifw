@@ -219,7 +219,7 @@ cat > "$APP_DIR/frontend/src/App.vue" <<'VUE'
         IFW Forwarding Panel
       </h1>
       <div class="small text-muted mt-2" style="font-size:1.07rem;letter-spacing:0.5px;">
-        Bảng điều khiển chuyển tiếp Port cho VPS - Giao diện hiện đại 2024
+        Bảng điều khiển chuyển tiếp Port cho VPS 
       </div>
     </div>
     <!-- Form -->
@@ -240,7 +240,7 @@ cat > "$APP_DIR/frontend/src/App.vue" <<'VUE'
           </div>
           <div class="col-md-3">
             <label class="form-label fw-semibold">IP đích</label>
-            <input v-model="newRule.toIp" type="text" class="form-control rounded-3 border-1 shadow-sm" required pattern="^\\d{1,3}(\\.\\d{1,3}){3}$">
+            <input v-model="newRule.toIp" type="text" class="form-control rounded-3 border-1 shadow-sm" required>
           </div>
           <div class="col-md-2">
             <label class="form-label fw-semibold">Cổng đích</label>
@@ -312,7 +312,7 @@ cat > "$APP_DIR/frontend/src/App.vue" <<'VUE'
       </div>
     </div>
     <div class="text-center mt-4 small text-secondary">
-      <span style="letter-spacing:0.2px">© 2024 IFW Panel - Tuỳ chỉnh &amp; tối ưu bởi <b>Tu Nguyen</b></span>
+      <span style="letter-spacing:0.2px">© 2025 IFW Panel - Tuỳ chỉnh &amp; tối ưu bởi <b>Tubetna</b></span> 
     </div>
   </div>
 </template>
@@ -477,6 +477,11 @@ sysctl -w net.ipv4.ip_forward=1
 iptables -P FORWARD ACCEPT
 iptables -I INPUT -p tcp --dport "$PANEL_PORT" -j ACCEPT || true
 iptables-save > /etc/iptables/rules.v4
+
+if [ ! -f "$APP_DIR/backend/rules.json" ]; then
+    echo '[]' > "$APP_DIR/backend/rules.json"
+    chmod 666 "$APP_DIR/backend/rules.json"
+fi
 
 IP=$(curl -s4 https://api.ipify.org)
 echo "==> HOÀN TẤT! Truy cập Panel: http://$IP:$PANEL_PORT/adminsetupfw/"
