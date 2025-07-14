@@ -66,9 +66,10 @@ func applyRule(r Rule) {
         removeRule(r)
         run(fmt.Sprintf("iptables -t nat -I PREROUTING -p %s --dport %s -j DNAT --to-destination %s:%s -m comment --comment gofw-%s", p, r.FromPort, r.ToIP, r.ToPort, r.ID))
         run(fmt.Sprintf("iptables -t nat -I POSTROUTING -p %s -d %s --dport %s -j MASQUERADE -m comment --comment gofw-%s", p, r.ToIP, r.ToPort, r.ID))
-        run(fmt.Sprintf("iptables -I FORWARD -p %s -d %s --dport %s -j ACCEPT", p, r.ToIP, r.ToPort))
-        run(fmt.Sprintf("iptables -I FORWARD -p %s -s %s --sport %s -j ACCEPT", p, r.ToIP, r.ToPort))
+        run(fmt.Sprintf("iptables -I FORWARD -p %s -d %s --dport %s -m comment --comment gofw-%s -j ACCEPT", p, r.ToIP, r.ToPort, r.ID))
+        run(fmt.Sprintf("iptables -I FORWARD -p %s -s %s --sport %s -m comment --comment gofw-%s -j ACCEPT", p, r.ToIP, r.ToPort, r.ID))
     }
+    run("iptables -C FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT")
 }
 
 func removeRule(r Rule) {
@@ -611,8 +612,18 @@ net.netfilter.nf_conntrack_max=1048576
 SYSCTL
 sysctl --system
 
+# FLUSH toàn bộ iptables và add rule quốc tế chuẩn
+iptables -F
+iptables -t nat -F
+iptables -X
+iptables -t nat -X
+
 iptables -P FORWARD ACCEPT
-iptables -F FORWARD
+iptables -P INPUT ACCEPT
+iptables -P OUTPUT ACCEPT
+
+iptables -C FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
 iptables -I INPUT -p tcp --dport "$PANEL_PORT" -j ACCEPT || true
 iptables-save > /etc/iptables/rules.v4
 
@@ -646,4 +657,4 @@ echo "==> HOÀN TẤT! Truy cập Panel: http://$IP:$PANEL_PORT/adminsetupfw/"
 
 systemctl restart ifw
 
-echo "==> DONE! Đã tối ưu forwarding quốc tế TCP/UDP"
+echo "==> DONE! Đã tối ưu forwarding quốc tế TCP/UDP, giao diện đẹp, quản lý port online!"
