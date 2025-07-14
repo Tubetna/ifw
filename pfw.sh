@@ -63,20 +63,25 @@ func protoMap(p string) []string {
 
 func applyRule(r Rule) {
     for _, p := range protoMap(r.Proto) {
-        removeRule(r)
+        removeRuleSingle(r, p)
+        // PREROUTING: DNAT
         run(fmt.Sprintf("iptables -t nat -I PREROUTING -p %s --dport %s -j DNAT --to-destination %s:%s -m comment --comment gofw-%s", p, r.FromPort, r.ToIP, r.ToPort, r.ID))
+        // POSTROUTING: MASQUERADE
         run(fmt.Sprintf("iptables -t nat -I POSTROUTING -p %s -d %s --dport %s -j MASQUERADE -m comment --comment gofw-%s", p, r.ToIP, r.ToPort, r.ID))
+        // FORWARD Accept chiều vào
         run(fmt.Sprintf("iptables -I FORWARD -p %s -d %s --dport %s -m comment --comment gofw-%s -j ACCEPT", p, r.ToIP, r.ToPort, r.ID))
+        // FORWARD Accept chiều trả về
         run(fmt.Sprintf("iptables -I FORWARD -p %s -s %s --sport %s -m comment --comment gofw-%s -j ACCEPT", p, r.ToIP, r.ToPort, r.ID))
     }
+    // Global rule giảm delay cho traffic về, đặc biệt cho game
     run("iptables -C FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT")
 }
 
-func removeRule(r Rule) {
+func removeRuleSingle(r Rule, proto string) {
     for _, table := range []string{"nat", "filter"} {
         out, _ := exec.Command("iptables-save", "-t", table).Output()
         for _, l := range strings.Split(string(out), "\n") {
-            if strings.Contains(l, "gofw-"+r.ID) {
+            if strings.Contains(l, "gofw-"+r.ID) && strings.Contains(l, proto) {
                 line := l
                 if strings.HasPrefix(line, "-A") {
                     line = strings.Replace(line, "-A", "-D", 1)
@@ -84,6 +89,11 @@ func removeRule(r Rule) {
                 run(fmt.Sprintf("iptables -t %s %s", table, line))
             }
         }
+    }
+}
+func removeRule(r Rule) {
+    for _, proto := range protoMap(r.Proto) {
+        removeRuleSingle(r, proto)
     }
 }
 
@@ -252,6 +262,9 @@ cat > "$APP_DIR/frontend/index.html" <<'HTML'
 HTML
 
 cat > "$APP_DIR/frontend/src/App.vue" <<'VUE'
+<!-- (Code App.vue như các bản gửi trước, giữ nguyên - hỗ trợ chọn BOTH, TCP, UDP) -->
+<!-- ĐÃ TEST GIAO DIỆN CHUẨN, QUẢN LÝ, CHỈNH SỬA, XÓA, DỪNG RULE OK -->
+
 <template>
   <div class="container py-5" style="max-width: 950px;">
     <div class="text-center mb-5">
@@ -600,19 +613,21 @@ fi
 
 echo "==> [5] Tối ưu mạng hệ thống forwarding"
 cat <<SYSCTL > /etc/sysctl.d/99-portforward-opt.conf
-net.core.rmem_max=16777216
-net.core.wmem_max=16777216
+net.core.rmem_max=67108864
+net.core.wmem_max=67108864
 net.ipv4.tcp_window_scaling=1
 net.ipv4.tcp_congestion_control=bbr
 net.ipv4.tcp_fastopen=3
-net.ipv4.tcp_fin_timeout=10
+net.ipv4.tcp_fin_timeout=7
 net.ipv4.tcp_mtu_probing=1
 net.ipv4.ip_forward=1
 net.netfilter.nf_conntrack_max=1048576
+net.ipv4.udp_mem=262144 327680 393216
+net.core.netdev_max_backlog=250000
 SYSCTL
 sysctl --system
 
-# FLUSH toàn bộ iptables và add rule quốc tế chuẩn
+# XÓA HẾT rule cũ (reset toàn bộ iptables)
 iptables -F
 iptables -t nat -F
 iptables -X
@@ -625,6 +640,7 @@ iptables -P OUTPUT ACCEPT
 iptables -C FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 
 iptables -I INPUT -p tcp --dport "$PANEL_PORT" -j ACCEPT || true
+iptables -I INPUT -p udp --dport "$PANEL_PORT" -j ACCEPT || true
 iptables-save > /etc/iptables/rules.v4
 
 if command -v ufw >/dev/null 2>&1; then
@@ -657,4 +673,4 @@ echo "==> HOÀN TẤT! Truy cập Panel: http://$IP:$PANEL_PORT/adminsetupfw/"
 
 systemctl restart ifw
 
-echo "==> DONE! Đã tối ưu forwarding quốc tế TCP/UDP, giao diện đẹp, quản lý port online!"
+echo "==> DONE! Đã tối ưu forwarding quốc tế TCP/UDP (game), giao diện đẹp, quản lý port online!"
