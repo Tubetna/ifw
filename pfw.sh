@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
 PANEL_PORT="${1:-2020}"
 APP_DIR="/opt/ifw"
 GO_VERSION="1.22.4"
@@ -10,7 +9,6 @@ echo "==> [0] Generate backend code"
 mkdir -p "$APP_DIR/backend"
 cat > "$APP_DIR/backend/main.go" <<'GO'
 package main
-
 import (
     "encoding/json"
     "fmt"
@@ -25,7 +23,6 @@ import (
     "flag"
     "strings"
 )
-
 type Rule struct {
     ID        string    `json:"id"`
     Proto     string    `json:"proto"`
@@ -35,19 +32,16 @@ type Rule struct {
     TimeAdded time.Time `json:"timeAdded"`
     Active    bool      `json:"active"`
 }
-
 var (
     rulesFile = "rules.json"
     rules     []Rule
     mu        sync.Mutex
 )
-
 func run(cmd string) error {
     log.Println("[CMD]", cmd)
     arr := strings.Fields(cmd)
     return exec.Command(arr[0], arr[1:]...).Run()
 }
-
 func protoMap(p string) []string {
     switch p {
     case "both", "all":
@@ -56,7 +50,6 @@ func protoMap(p string) []string {
         return []string{p}
     }
 }
-
 func applyRule(r Rule) {
     for _, p := range protoMap(r.Proto) {
         run(fmt.Sprintf("iptables -t nat -A PREROUTING -p %s --dport %s -j DNAT --to-destination %s:%s -m comment --comment gofw-%s", p, r.FromPort, r.ToIP, r.ToPort, r.ID))
@@ -65,7 +58,6 @@ func applyRule(r Rule) {
         run(fmt.Sprintf("iptables -I FORWARD -p %s -s %s --sport %s -j ACCEPT", p, r.ToIP, r.ToPort))
     }
 }
-
 func removeRule(r Rule) {
     out, _ := exec.Command("iptables-save").Output()
     for _, l := range strings.Split(string(out), "\n") {
@@ -75,7 +67,6 @@ func removeRule(r Rule) {
         }
     }
 }
-
 func saveRules() {
     f, _ := os.Create(rulesFile)
     defer f.Close()
@@ -83,28 +74,23 @@ func saveRules() {
     enc.SetIndent("", "  ")
     enc.Encode(rules)
 }
-
 func loadRules() {
     f, err := os.Open(rulesFile)
     if err != nil { return }
     defer f.Close()
     json.NewDecoder(f).Decode(&rules)
 }
-
 func main() {
     var port int
     flag.IntVar(&port, "port", 2020, "Port for admin panel")
     flag.Parse()
-
     abs, _ := filepath.Abs(rulesFile)
     rulesFile = abs
     loadRules()
     for _, r := range rules { if r.Active { applyRule(r) } }
-
     mux := http.NewServeMux()
     mux.Handle("/adminsetupfw/assets/", http.StripPrefix("/adminsetupfw/", http.FileServer(http.Dir("public"))))
     mux.Handle("/adminsetupfw/", http.StripPrefix("/adminsetupfw/", http.FileServer(http.Dir("public"))))
-
     mux.HandleFunc("/api/rules", func(w http.ResponseWriter, r *http.Request) {
         mu.Lock(); defer mu.Unlock()
         if r.Method == "GET" {
@@ -139,7 +125,6 @@ func main() {
         }
         http.Error(w, "Method not allowed", 405)
     })
-
     mux.HandleFunc("/api/rules/", func(w http.ResponseWriter, r *http.Request) {
         mu.Lock(); defer mu.Unlock()
         id := strings.TrimPrefix(r.URL.Path, "/api/rules/")
@@ -162,7 +147,6 @@ func main() {
         }
         http.Error(w, "Method not allowed", 405)
     })
-
     log.Printf("GoPortPanel đang chạy tại http://0.0.0.0:%d/adminsetupfw/\n", port)
     http.ListenAndServe(fmt.Sprintf("0.0.0.0:%d", port), mux)
 }
@@ -295,11 +279,9 @@ import { ref, onMounted } from 'vue'
 const rules = ref([])
 const error = ref("")
 const newRule = ref({ proto: 'tcp', fromPort: '', toIp: '', toPort: '' })
-
 const fetchRules = async () => {
   rules.value = await (await fetch('/api/rules')).json()
 }
-
 const addRule = async () => {
   error.value = ""
   if (!newRule.value.fromPort || !newRule.value.toIp || !newRule.value.toPort) {
@@ -335,7 +317,6 @@ const addRule = async () => {
     error.value = "Lỗi kết nối server"
   }
 }
-
 const toggleRule = async (rule) => {
   error.value = ""
   try {
