@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+
 PANEL_PORT="${1:-2020}"
 APP_DIR="/opt/ifw"
 GO_VERSION="1.22.4"
@@ -11,193 +12,191 @@ cat > "$APP_DIR/backend/main.go" <<'GO'
 package main
 
 import (
-	"encoding/json"
-	"fmt"
-	"io"
-	"log"
-	"net/http"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"sync"
-	"time"
-	"flag"
-	"strings"
+    "encoding/json"
+    "fmt"
+    "io"
+    "log"
+    "net/http"
+    "os"
+    "os/exec"
+    "path/filepath"
+    "sync"
+    "time"
+    "flag"
+    "strings"
 )
 
 type Rule struct {
-	ID        string    `json:"id"`
-	Proto     string    `json:"proto"`
-	FromPort  string    `json:"fromPort"`
-	ToIP      string    `json:"toIp"`
-	ToPort    string    `json:"toPort"`
-	TimeAdded time.Time `json:"timeAdded"`
-	Active    bool      `json:"active"`
+    ID        string    `json:"id"`
+    Proto     string    `json:"proto"`
+    FromPort  string    `json:"fromPort"`
+    ToIP      string    `json:"toIp"`
+    ToPort    string    `json:"toPort"`
+    TimeAdded time.Time `json:"timeAdded"`
+    Active    bool      `json:"active"`
 }
 
 var (
-	rulesFile = "rules.json"
-	rules     []Rule
-	mu        sync.Mutex
+    rulesFile = "rules.json"
+    rules     []Rule
+    mu        sync.Mutex
 )
 
 func run(cmd string) error {
-	log.Println("[CMD]", cmd)
-	arr := strings.Fields(cmd)
-	return exec.Command(arr[0], arr[1:]...).Run()
+    log.Println("[CMD]", cmd)
+    arr := strings.Fields(cmd)
+    out, err := exec.Command(arr[0], arr[1:]...).CombinedOutput()
+    if err != nil {
+        log.Printf("[ERR] %s: %s", cmd, out)
+    }
+    return err
 }
 
 func protoMap(p string) []string {
-	switch p {
-	case "both", "all":
-		return []string{"tcp", "udp"}
-	default:
-		return []string{p}
-	}
+    switch strings.ToLower(p) {
+    case "both", "all":
+        return []string{"tcp", "udp"}
+    default:
+        return []string{strings.ToLower(p)}
+    }
 }
 
 func applyRule(r Rule) {
-	for _, p := range protoMap(r.Proto) {
-		// Xoá rule cũ (nếu có) để tránh duplicate
-		removeRule(r)
-		// Tối ưu: set --tcp-flags (tăng tốc TCP), bật tối ưu throughput
-		run(fmt.Sprintf("iptables -t nat -A PREROUTING -p %s --dport %s -j DNAT --to-destination %s:%s -m comment --comment gofw-%s", p, r.FromPort, r.ToIP, r.ToPort, r.ID))
-		run(fmt.Sprintf("iptables -t nat -A POSTROUTING -p %s -d %s --dport %s -j MASQUERADE -m comment --comment gofw-%s", p, r.ToIP, r.ToPort, r.ID))
-		run(fmt.Sprintf("iptables -I FORWARD -p %s -d %s --dport %s -j ACCEPT", p, r.ToIP, r.ToPort))
-		run(fmt.Sprintf("iptables -I FORWARD -p %s -s %s --sport %s -j ACCEPT", p, r.ToIP, r.ToPort))
-	}
+    for _, p := range protoMap(r.Proto) {
+        removeRule(r)
+        run(fmt.Sprintf("iptables -t nat -I PREROUTING -p %s --dport %s -j DNAT --to-destination %s:%s -m comment --comment gofw-%s", p, r.FromPort, r.ToIP, r.ToPort, r.ID))
+        run(fmt.Sprintf("iptables -t nat -I POSTROUTING -p %s -d %s --dport %s -j MASQUERADE -m comment --comment gofw-%s", p, r.ToIP, r.ToPort, r.ID))
+        run(fmt.Sprintf("iptables -I FORWARD -p %s -d %s --dport %s -j ACCEPT", p, r.ToIP, r.ToPort))
+        run(fmt.Sprintf("iptables -I FORWARD -p %s -s %s --sport %s -j ACCEPT", p, r.ToIP, r.ToPort))
+    }
 }
 
 func removeRule(r Rule) {
-	out, _ := exec.Command("iptables-save").Output()
-	for _, l := range strings.Split(string(out), "\n") {
-		if strings.Contains(l, "gofw-"+r.ID) {
-			line := l
-			if strings.HasPrefix(line, "-A") {
-				line = strings.Replace(line, "-A", "-D", 1)
-			}
-			run("iptables -t nat " + line)
-			run("iptables " + line)
-		}
-	}
+    for _, table := range []string{"nat", "filter"} {
+        out, _ := exec.Command("iptables-save", "-t", table).Output()
+        for _, l := range strings.Split(string(out), "\n") {
+            if strings.Contains(l, "gofw-"+r.ID) {
+                line := l
+                if strings.HasPrefix(line, "-A") {
+                    line = strings.Replace(line, "-A", "-D", 1)
+                }
+                run(fmt.Sprintf("iptables -t %s %s", table, line))
+            }
+        }
+    }
 }
 
 func saveRules() {
-	f, _ := os.Create(rulesFile)
-	defer f.Close()
-	enc := json.NewEncoder(f)
-	enc.SetIndent("", "  ")
-	enc.Encode(rules)
+    f, _ := os.Create(rulesFile)
+    defer f.Close()
+    enc := json.NewEncoder(f)
+    enc.SetIndent("", "  ")
+    enc.Encode(rules)
 }
 
 func loadRules() {
-	f, err := os.Open(rulesFile)
-	if err != nil { return }
-	defer f.Close()
-	json.NewDecoder(f).Decode(&rules)
+    f, err := os.Open(rulesFile)
+    if err != nil { return }
+    defer f.Close()
+    json.NewDecoder(f).Decode(&rules)
 }
 
 func main() {
-	var port int
-	flag.IntVar(&port, "port", 2020, "Port for admin panel")
-	flag.Parse()
-	abs, _ := filepath.Abs(rulesFile)
-	rulesFile = abs
-	loadRules()
-	for _, r := range rules { if r.Active { applyRule(r) } }
-	mux := http.NewServeMux()
-	mux.Handle("/adminsetupfw/assets/", http.StripPrefix("/adminsetupfw/", http.FileServer(http.Dir("public"))))
-	mux.Handle("/adminsetupfw/", http.StripPrefix("/adminsetupfw/", http.FileServer(http.Dir("public"))))
-	mux.HandleFunc("/api/rules", func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock(); defer mu.Unlock()
-		if r.Method == "GET" {
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(rules)
-			return
-		}
-		if r.Method == "POST" {
-			var in Rule
-			body, _ := io.ReadAll(r.Body)
-			if err := json.Unmarshal(body, &in); err != nil {
-				http.Error(w, "invalid json", 400)
-				return
-			}
-			if in.FromPort == "" || in.ToIP == "" || in.ToPort == "" {
-				http.Error(w, "missing", 400)
-				return
-			}
-			// Check rule trùng port
-			for _, x := range rules {
-				if x.FromPort == in.FromPort && x.Proto == in.Proto && x.Active {
-					http.Error(w, "Port này đã được forward!", 409)
-					return
-				}
-			}
-			in.ID = fmt.Sprintf("%d", time.Now().UnixNano())
-			in.TimeAdded = time.Now()
-			in.Active = true
-			rules = append(rules, in)
-			applyRule(in)
-			saveRules()
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(in)
-			return
-		}
-		http.Error(w, "Method not allowed", 405)
-	})
-	mux.HandleFunc("/api/rules/", func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock(); defer mu.Unlock()
-		id := strings.TrimPrefix(r.URL.Path, "/api/rules/")
-		if strings.HasSuffix(id, "/toggle") {
-			id = strings.TrimSuffix(id, "/toggle")
-		}
-		idx := -1
-		for i, x := range rules { if x.ID == id { idx = i } }
-		if idx == -1 { http.Error(w, "not found", 404); return }
-		if r.Method == "DELETE" {
-			removeRule(rules[idx])
-			rules = append(rules[:idx], rules[idx+1:]...)
-			saveRules()
-			w.WriteHeader(204)
-			return
-		}
-		// Toggle
-		if r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/toggle") {
-			rules[idx].Active = !rules[idx].Active
-			if rules[idx].Active { applyRule(rules[idx]) } else { removeRule(rules[idx]) }
-			saveRules()
-			json.NewEncoder(w).Encode(rules[idx])
-			return
-		}
-		// EDIT: Cập nhật rule
-		if r.Method == "PUT" {
-			var in Rule
-			body, _ := io.ReadAll(r.Body)
-			if err := json.Unmarshal(body, &in); err != nil {
-				http.Error(w, "invalid json", 400)
-				return
-			}
-			// Check trùng port (trừ chính mình)
-			for i, x := range rules {
-				if i != idx && x.FromPort == in.FromPort && x.Proto == in.Proto && x.Active {
-					http.Error(w, "Port này đã được forward!", 409)
-					return
-				}
-			}
-			rules[idx].Proto = in.Proto
-			rules[idx].FromPort = in.FromPort
-			rules[idx].ToIP = in.ToIP
-			rules[idx].ToPort = in.ToPort
-			// Nếu rule đang active thì áp lại ngay!
-			if rules[idx].Active { applyRule(rules[idx]) }
-			saveRules()
-			json.NewEncoder(w).Encode(rules[idx])
-			return
-		}
-		http.Error(w, "Method not allowed", 405)
-	})
-	log.Printf("GoPortPanel chạy tại http://0.0.0.0:%d/adminsetupfw/\n", port)
-	http.ListenAndServe(fmt.Sprintf("0.0.0.0:%d", port), mux)
+    var port int
+    flag.IntVar(&port, "port", 2020, "Port for admin panel")
+    flag.Parse()
+    abs, _ := filepath.Abs(rulesFile)
+    rulesFile = abs
+    loadRules()
+    for _, r := range rules { if r.Active { applyRule(r) } }
+    mux := http.NewServeMux()
+    mux.Handle("/adminsetupfw/assets/", http.StripPrefix("/adminsetupfw/", http.FileServer(http.Dir("public"))))
+    mux.Handle("/adminsetupfw/", http.StripPrefix("/adminsetupfw/", http.FileServer(http.Dir("public"))))
+    mux.HandleFunc("/api/rules", func(w http.ResponseWriter, r *http.Request) {
+        mu.Lock(); defer mu.Unlock()
+        if r.Method == "GET" {
+            w.Header().Set("Content-Type", "application/json")
+            json.NewEncoder(w).Encode(rules)
+            return
+        }
+        if r.Method == "POST" {
+            var in Rule
+            body, _ := io.ReadAll(r.Body)
+            if err := json.Unmarshal(body, &in); err != nil {
+                http.Error(w, "invalid json", 400)
+                return
+            }
+            if in.FromPort == "" || in.ToIP == "" || in.ToPort == "" {
+                http.Error(w, "missing", 400)
+                return
+            }
+            for _, x := range rules {
+                if x.FromPort == in.FromPort && x.Proto == in.Proto && x.Active {
+                    http.Error(w, "Port này đã được forward!", 409)
+                    return
+                }
+            }
+            in.ID = fmt.Sprintf("%d", time.Now().UnixNano())
+            in.TimeAdded = time.Now()
+            in.Active = true
+            rules = append(rules, in)
+            applyRule(in)
+            saveRules()
+            w.Header().Set("Content-Type", "application/json")
+            json.NewEncoder(w).Encode(in)
+            return
+        }
+        http.Error(w, "Method not allowed", 405)
+    })
+    mux.HandleFunc("/api/rules/", func(w http.ResponseWriter, r *http.Request) {
+        mu.Lock(); defer mu.Unlock()
+        id := strings.TrimPrefix(r.URL.Path, "/api/rules/")
+        if strings.HasSuffix(id, "/toggle") {
+            id = strings.TrimSuffix(id, "/toggle")
+        }
+        idx := -1
+        for i, x := range rules { if x.ID == id { idx = i } }
+        if idx == -1 { http.Error(w, "not found", 404); return }
+        if r.Method == "DELETE" {
+            removeRule(rules[idx])
+            rules = append(rules[:idx], rules[idx+1:]...)
+            saveRules()
+            w.WriteHeader(204)
+            return
+        }
+        if r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/toggle") {
+            rules[idx].Active = !rules[idx].Active
+            if rules[idx].Active { applyRule(rules[idx]) } else { removeRule(rules[idx]) }
+            saveRules()
+            json.NewEncoder(w).Encode(rules[idx])
+            return
+        }
+        if r.Method == "PUT" {
+            var in Rule
+            body, _ := io.ReadAll(r.Body)
+            if err := json.Unmarshal(body, &in); err != nil {
+                http.Error(w, "invalid json", 400)
+                return
+            }
+            for i, x := range rules {
+                if i != idx && x.FromPort == in.FromPort && x.Proto == in.Proto && x.Active {
+                    http.Error(w, "Port này đã được forward!", 409)
+                    return
+                }
+            }
+            rules[idx].Proto = in.Proto
+            rules[idx].FromPort = in.FromPort
+            rules[idx].ToIP = in.ToIP
+            rules[idx].ToPort = in.ToPort
+            if rules[idx].Active { applyRule(rules[idx]) }
+            saveRules()
+            json.NewEncoder(w).Encode(rules[idx])
+            return
+        }
+        http.Error(w, "Method not allowed", 405)
+    })
+    log.Printf("GoPortPanel chạy tại http://0.0.0.0:%d/adminsetupfw/\n", port)
+    http.ListenAndServe(fmt.Sprintf("0.0.0.0:%d", port), mux)
 }
 GO
 
@@ -208,6 +207,7 @@ GOMOD
 
 echo "==> [1] Frontend Vue3 đẹp, hỗ trợ sửa rule, cảnh báo port trùng"
 mkdir -p "$APP_DIR/frontend/src"
+
 cat > "$APP_DIR/frontend/package.json" <<'PKG'
 {
   "name": "ifw-ui",
@@ -261,7 +261,6 @@ cat > "$APP_DIR/frontend/src/App.vue" <<'VUE'
         Bảng điều khiển chuyển tiếp Port cho VPS
       </div>
     </div>
-    <!-- Form -->
     <div class="card shadow-lg border-0 rounded-4 mb-5" style="background:rgba(255,255,255,0.98);">
       <div class="card-body p-4">
         <form @submit.prevent="addRule" class="row g-3 align-items-end">
@@ -294,7 +293,6 @@ cat > "$APP_DIR/frontend/src/App.vue" <<'VUE'
         <div v-if="error" class="alert alert-danger mt-3 py-2 px-3 rounded-3 shadow-sm" role="alert">{{ error }}</div>
       </div>
     </div>
-    <!-- Table -->
     <div class="card shadow-lg border-0 rounded-4" style="background:rgba(255,255,255,0.97);">
       <div class="card-body p-4">
         <div class="d-flex justify-content-between align-items-center mb-3">
@@ -564,9 +562,10 @@ export default defineConfig({
 })
 VITE
 
-echo "==> [2] Cài Go, Node, git, iptables-persistent, tối ưu kernel/net"
+echo "==> [2] Cài Go, Node, iptables-persistent, tối ưu kernel/net"
 apt-get update -y
 apt-get install -y curl git iptables-persistent build-essential
+
 if ! command -v go >/dev/null 2>&1; then
     curl -sL https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz | tar -xz -C /usr/local
     export PATH="/usr/local/go/bin:$PATH"
@@ -589,12 +588,10 @@ echo "==> [4] Build frontend Vue3"
 cd "$APP_DIR/frontend"
 npm run build
 
-# Copy build ra public (sửa trắng trang)
 rm -rf "$APP_DIR/backend/public"
 mkdir -p "$APP_DIR/backend/public"
 cp -r dist/* "$APP_DIR/backend/public/"
 
-# Tạo file rules.json nếu chưa có
 if [ ! -f "$APP_DIR/backend/rules.json" ]; then
     echo '[]' > "$APP_DIR/backend/rules.json"
     chmod 666 "$APP_DIR/backend/rules.json"
@@ -615,8 +612,17 @@ SYSCTL
 sysctl --system
 
 iptables -P FORWARD ACCEPT
+iptables -F FORWARD
 iptables -I INPUT -p tcp --dport "$PANEL_PORT" -j ACCEPT || true
 iptables-save > /etc/iptables/rules.v4
+
+if command -v ufw >/dev/null 2>&1; then
+    ufw disable || true
+fi
+if systemctl is-active --quiet firewalld; then
+    systemctl stop firewalld
+    systemctl disable firewalld
+fi
 
 echo "==> [6] Tạo systemd service"
 cat > /etc/systemd/system/ifw.service <<EOF
@@ -638,7 +644,6 @@ systemctl enable --now ifw.service
 IP=$(curl -s4 https://api.ipify.org)
 echo "==> HOÀN TẤT! Truy cập Panel: http://$IP:$PANEL_PORT/adminsetupfw/"
 
-# Khởi động lại service chắc chắn
 systemctl restart ifw
 
-echo "==> DONE! Đã tối ưu forwarding quốc tế TCP/UDP "
+echo "==> DONE! Đã tối ưu forwarding quốc tế TCP/UDP"
