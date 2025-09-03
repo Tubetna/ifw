@@ -7,7 +7,7 @@ APP_DIR="/opt/ifw"
 GO_VERSION="1.22.4"
 export DEBIAN_FRONTEND=noninteractive
 
-echo "==> [0] Tạo mã nguồn backend Go + frontend Vue (kèm anti-DDoS & /api/blocked)"
+echo "==> [0] Tạo mã nguồn backend + frontend (có Rate Config UI)"
 mkdir -p "$APP_DIR/backend" "$APP_DIR/frontend/src"
 
 cat > "$APP_DIR/backend/main.go" <<'GO'
@@ -38,31 +38,38 @@ type Rule struct {
     Active    bool      `json:"active"`
 }
 
+type Config struct {
+    DDOSDefense  bool `json:"ddosDefense"`
+    TcpSynPerIp  int  `json:"tcpSynPerIp"`
+    TcpSynBurst  int  `json:"tcpSynBurst"`
+    TcpConnPerIp int  `json:"tcpConnPerIp"`
+    UdpPpsPerIp  int  `json:"udpPpsPerIp"`
+    UdpBurst     int  `json:"udpBurst"`
+}
+
 var (
-    rulesFile = "rules.json"
-    rules     []Rule
-    mu        sync.Mutex
+    rulesFile  = "rules.json"
+    configFile = "config.json"
+    rules      []Rule
+    cfg        Config
+    mu         sync.Mutex
 )
 
-// ---- DDoS defense config (an toàn cho game, có thể chỉnh qua env) ----
-var (
-    defenseEnabled = os.Getenv("DDOS_DEFENSE") != "0"
-
-    // Defaults “safe” để tránh false positive:
-    tcpSynPerIP  = getenvInt("DDOS_TCP_SYN_PER_IP", 150)  // SYN/giây/IP
-    tcpSynBurst  = getenvInt("DDOS_TCP_SYN_BURST", 300)
-    tcpConnPerIP = getenvInt("DDOS_TCP_CONN_PER_IP", 250) // concurrent/IP
-
-    udpPpsPerIP  = getenvInt("DDOS_UDP_PPS_PER_IP", 8000) // packet/giây/IP (NEW)
-    udpBurst     = getenvInt("DDOS_UDP_BURST", 12000)
-)
+func defaultConfig() Config {
+    return Config{
+        DDOSDefense:  true,
+        TcpSynPerIp:  150,
+        TcpSynBurst:  300,
+        TcpConnPerIp: 250,
+        UdpPpsPerIp:  8000,
+        UdpBurst:     12000,
+    }
+}
 
 func getenvInt(k string, def int) int {
     if v := os.Getenv(k); v != "" {
         var x int
-        if _, err := fmt.Sscanf(v, "%d", &x); err == nil && x > 0 {
-            return x
-        }
+        if _, err := fmt.Sscanf(v, "%d", &x); err == nil && x > 0 { return x }
     }
     return def
 }
@@ -123,25 +130,19 @@ func removeWhitelistBypass(r Rule) {
 }
 
 func applyDefense(r Rule) {
-    if !defenseEnabled { return }
+    if !cfg.DDOSDefense { return }
     id := r.ID
-
-    // Cắt INVALID riêng cho cổng/đích này
     run(fmt.Sprintf(`iptables -I FORWARD -m conntrack --ctstate INVALID -d %s --dport %s -m comment --comment gofwdef-%s -j DROP`, r.ToIP, r.ToPort, id))
-
     for _, p := range protoMap(r.Proto) {
         if p == "tcp" {
-            // Giới hạn NEW (SYN) theo IP nguồn
             run(fmt.Sprintf(`iptables -I FORWARD -p tcp --syn -d %s --dport %s -m hashlimit --hashlimit-above %d/second --hashlimit-burst %d --hashlimit-mode srcip --hashlimit-name syn-%s -m comment --comment gofwdef-%s -j DROP`,
-                r.ToIP, r.ToPort, tcpSynPerIP, tcpSynBurst, id, id))
-            // Giới hạn concurrent theo IP
+                r.ToIP, r.ToPort, cfg.TcpSynPerIp, cfg.TcpSynBurst, id, id))
             run(fmt.Sprintf(`iptables -I FORWARD -p tcp -d %s --dport %s -m connlimit --connlimit-above %d --connlimit-mask 32 -m comment --comment gofwdef-%s -j DROP`,
-                r.ToIP, r.ToPort, tcpConnPerIP, id))
+                r.ToIP, r.ToPort, cfg.TcpConnPerIp, id))
         }
         if p == "udp" {
-            // Chỉ bóp gói NEW, flow đang chơi không bị ảnh hưởng
             run(fmt.Sprintf(`iptables -I FORWARD -p udp -d %s --dport %s -m conntrack --ctstate NEW -m hashlimit --hashlimit-above %d/second --hashlimit-burst %d --hashlimit-mode srcip --hashlimit-name udpf-%s -m comment --comment gofwdef-%s -j DROP`,
-                r.ToIP, r.ToPort, udpPpsPerIP, udpBurst, id, id))
+                r.ToIP, r.ToPort, cfg.UdpPpsPerIp, cfg.UdpBurst, id, id))
         }
     }
 }
@@ -164,18 +165,12 @@ func removeDefense(r Rule) {
 func applyRule(r Rule) {
     for _, p := range protoMap(r.Proto) {
         removeRuleSingle(r, p)
-        // DNAT
         run(fmt.Sprintf("iptables -t nat -I PREROUTING -p %s --dport %s -j DNAT --to-destination %s:%s -m comment --comment gofw-%s", p, r.FromPort, r.ToIP, r.ToPort, r.ID))
-        // MASQUERADE
         run(fmt.Sprintf("iptables -t nat -I POSTROUTING -p %s -d %s --dport %s -j MASQUERADE -m comment --comment gofw-%s", p, r.ToIP, r.ToPort, r.ID))
-        // FORWARD Accept chiều vào/ra
         run(fmt.Sprintf("iptables -I FORWARD -p %s -d %s --dport %s -m comment --comment gofw-%s -j ACCEPT", p, r.ToIP, r.ToPort, r.ID))
         run(fmt.Sprintf("iptables -I FORWARD -p %s -s %s --sport %s -m comment --comment gofw-%s -j ACCEPT", p, r.ToIP, r.ToPort, r.ID))
     }
-    // Global giảm delay
     run("iptables -C FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT")
-
-    // Ưu tiên whitelist (không chặn nhầm người thật), rồi mới defense
     applyWhitelistBypass(r)
     applyDefense(r)
 }
@@ -203,6 +198,41 @@ func loadRules() {
     json.NewDecoder(f).Decode(&rules)
 }
 
+func saveConfig() error {
+    f, err := os.Create(configFile)
+    if err != nil { return err }
+    defer f.Close()
+    enc := json.NewEncoder(f)
+    enc.SetIndent("", "  ")
+    return enc.Encode(cfg)
+}
+
+func loadConfig() {
+    // Base defaults
+    cfg = defaultConfig()
+    // Allow env override on first boot
+    cfg.TcpSynPerIp  = getenvInt("DDOS_TCP_SYN_PER_IP", cfg.TcpSynPerIp)
+    cfg.TcpSynBurst  = getenvInt("DDOS_TCP_SYN_BURST",  cfg.TcpSynBurst)
+    cfg.TcpConnPerIp = getenvInt("DDOS_TCP_CONN_PER_IP",cfg.TcpConnPerIp)
+    cfg.UdpPpsPerIp  = getenvInt("DDOS_UDP_PPS_PER_IP", cfg.UdpPpsPerIp)
+    cfg.UdpBurst     = getenvInt("DDOS_UDP_BURST",     cfg.UdpBurst)
+    if os.Getenv("DDOS_DEFENSE") == "0" { cfg.DDOSDefense = false }
+
+    f, err := os.Open(configFile)
+    if err != nil { _ = saveConfig(); return }
+    defer f.Close()
+    var c Config
+    if err := json.NewDecoder(f).Decode(&c); err == nil {
+        if c.TcpSynPerIp > 0 { cfg.TcpSynPerIp = c.TcpSynPerIp }
+        if c.TcpSynBurst > 0 { cfg.TcpSynBurst = c.TcpSynBurst }
+        if c.TcpConnPerIp > 0 { cfg.TcpConnPerIp = c.TcpConnPerIp }
+        if c.UdpPpsPerIp > 0 { cfg.UdpPpsPerIp = c.UdpPpsPerIp }
+        if c.UdpBurst > 0 { cfg.UdpBurst = c.UdpBurst }
+        cfg.DDOSDefense = c.DDOSDefense
+    }
+    _ = saveConfig()
+}
+
 func listIPSet(name string) ([]string, error) {
     out, err := exec.Command("ipset", "list", name, "-o", "save").CombinedOutput()
     if err != nil { return nil, fmt.Errorf("ipset list error: %v\n%s", err, string(out)) }
@@ -218,18 +248,30 @@ func listIPSet(name string) ([]string, error) {
 
 type ipReq struct{ IP string `json:"ip"` }
 
+func refreshDefenseAll() {
+    // Re-apply defense for all active rules to take new limits immediately
+    for _, r := range rules {
+        if r.Active {
+            removeDefense(r)
+            applyDefense(r)
+        }
+    }
+}
+
 func main() {
     var port int
     flag.IntVar(&port, "port", 2020, "Port for admin panel")
     flag.Parse()
     abs, _ := filepath.Abs(rulesFile)
     rulesFile = abs
+    absC, _ := filepath.Abs(configFile)
+    configFile = absC
 
-    // Chuẩn bị ipset block/white & hook raw PREROUTING
     run("ipset create gofw_block hash:ip family inet maxelem 200000 -exist")
     run("ipset create gofw_white hash:ip family inet maxelem 100000 -exist")
     run("iptables -t raw -C PREROUTING -m set --match-set gofw_block src -j DROP || iptables -t raw -I PREROUTING -m set --match-set gofw_block src -j DROP")
 
+    loadConfig()
     loadRules()
     for _, r := range rules { if r.Active { applyRule(r) } }
 
@@ -242,18 +284,13 @@ func main() {
         mu.Lock(); defer mu.Unlock()
         if r.Method == "GET" {
             w.Header().Set("Content-Type", "application/json")
-            json.NewEncoder(w).Encode(rules)
-            return
+            json.NewEncoder(w).Encode(rules); return
         }
         if r.Method == "POST" {
             var in Rule
             body, _ := io.ReadAll(r.Body)
-            if err := json.Unmarshal(body, &in); err != nil {
-                http.Error(w, "invalid json", 400); return
-            }
-            if in.FromPort == "" || in.ToIP == "" || in.ToPort == "" {
-                http.Error(w, "missing", 400); return
-            }
+            if err := json.Unmarshal(body, &in); err != nil { http.Error(w, "invalid json", 400); return }
+            if in.FromPort == "" || in.ToIP == "" || in.ToPort == "" { http.Error(w, "missing", 400); return }
             for _, x := range rules {
                 if x.FromPort == in.FromPort && strings.EqualFold(x.Proto, in.Proto) && x.Active {
                     http.Error(w, "Port này đã được forward!", 409); return
@@ -266,17 +303,14 @@ func main() {
             applyRule(in)
             saveRules()
             w.Header().Set("Content-Type", "application/json")
-            json.NewEncoder(w).Encode(in)
-            return
+            json.NewEncoder(w).Encode(in); return
         }
         http.Error(w, "Method not allowed", 405)
     })
     mux.HandleFunc("/api/rules/", func(w http.ResponseWriter, r *http.Request) {
         mu.Lock(); defer mu.Unlock()
         id := strings.TrimPrefix(r.URL.Path, "/api/rules/")
-        if strings.HasSuffix(id, "/toggle") {
-            id = strings.TrimSuffix(id, "/toggle")
-        }
+        if strings.HasSuffix(id, "/toggle") { id = strings.TrimSuffix(id, "/toggle") }
         idx := -1
         for i, x := range rules { if x.ID == id { idx = i } }
         if idx == -1 { http.Error(w, "not found", 404); return }
@@ -285,29 +319,24 @@ func main() {
             removeRule(rules[idx])
             rules = append(rules[:idx], rules[idx+1:]...)
             saveRules()
-            w.WriteHeader(204)
-            return
+            w.WriteHeader(204); return
         }
         if r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/toggle") {
             rules[idx].Active = !rules[idx].Active
             if rules[idx].Active { applyRule(rules[idx]) } else { removeRule(rules[idx]) }
             saveRules()
             w.Header().Set("Content-Type", "application/json")
-            json.NewEncoder(w).Encode(rules[idx])
-            return
+            json.NewEncoder(w).Encode(rules[idx]); return
         }
         if r.Method == "PUT" {
             var in Rule
             body, _ := io.ReadAll(r.Body)
-            if err := json.Unmarshal(body, &in); err != nil {
-                http.Error(w, "invalid json", 400); return
-            }
+            if err := json.Unmarshal(body, &in); err != nil { http.Error(w, "invalid json", 400); return }
             for i, x := range rules {
                 if i != idx && x.FromPort == in.FromPort && strings.EqualFold(x.Proto, in.Proto) && x.Active {
                     http.Error(w, "Port này đã được forward!", 409); return
                 }
             }
-            // cập nhật
             wasActive := rules[idx].Active
             if wasActive { removeDefense(rules[idx]); removeWhitelistBypass(rules[idx]) }
             rules[idx].Proto = in.Proto
@@ -317,8 +346,7 @@ func main() {
             if wasActive { applyRule(rules[idx]) }
             saveRules()
             w.Header().Set("Content-Type", "application/json")
-            json.NewEncoder(w).Encode(rules[idx])
-            return
+            json.NewEncoder(w).Encode(rules[idx]); return
         }
         http.Error(w, "Method not allowed", 405)
     })
@@ -328,24 +356,16 @@ func main() {
         if r.Method != "POST" { http.Error(w, "Method not allowed", 405); return }
         var in ipReq
         body, _ := io.ReadAll(r.Body)
-        if err := json.Unmarshal(body, &in); err != nil || in.IP == "" {
-            http.Error(w, "invalid json/ip", 400); return
-        }
-        if err := run(fmt.Sprintf("ipset add gofw_block %s -exist", in.IP)); err != nil {
-            http.Error(w, "failed", 500); return
-        }
+        if err := json.Unmarshal(body, &in); err != nil || in.IP == "" { http.Error(w, "invalid json/ip", 400); return }
+        if err := run(fmt.Sprintf("ipset add gofw_block %s -exist", in.IP)); err != nil { http.Error(w, "failed", 500); return }
         w.WriteHeader(204)
     })
     mux.HandleFunc("/api/unblock", func(w http.ResponseWriter, r *http.Request) {
         if r.Method != "POST" { http.Error(w, "Method not allowed", 405); return }
         var in ipReq
         body, _ := io.ReadAll(r.Body)
-        if err := json.Unmarshal(body, &in); err != nil || in.IP == "" {
-            http.Error(w, "invalid json/ip", 400); return
-        }
-        if err := run(fmt.Sprintf("ipset del gofw_block %s", in.IP)); err != nil {
-            http.Error(w, "failed", 500); return
-        }
+        if err := json.Unmarshal(body, &in); err != nil || in.IP == "" { http.Error(w, "invalid json/ip", 400); return }
+        if err := run(fmt.Sprintf("ipset del gofw_block %s", in.IP)); err != nil { http.Error(w, "failed", 500); return }
         w.WriteHeader(204)
     })
     mux.HandleFunc("/api/blocked", func(w http.ResponseWriter, r *http.Request) {
@@ -361,24 +381,16 @@ func main() {
         if r.Method != "POST" { http.Error(w, "Method not allowed", 405); return }
         var in ipReq
         body, _ := io.ReadAll(r.Body)
-        if err := json.Unmarshal(body, &in); err != nil || in.IP == "" {
-            http.Error(w, "invalid json/ip", 400); return
-        }
-        if err := run(fmt.Sprintf("ipset add gofw_white %s -exist", in.IP)); err != nil {
-            http.Error(w, "failed", 500); return
-        }
+        if err := json.Unmarshal(body, &in); err != nil || in.IP == "" { http.Error(w, "invalid json/ip", 400); return }
+        if err := run(fmt.Sprintf("ipset add gofw_white %s -exist", in.IP)); err != nil { http.Error(w, "failed", 500); return }
         w.WriteHeader(204)
     })
     mux.HandleFunc("/api/unwhitelist", func(w http.ResponseWriter, r *http.Request) {
         if r.Method != "POST" { http.Error(w, "Method not allowed", 405); return }
         var in ipReq
         body, _ := io.ReadAll(r.Body)
-        if err := json.Unmarshal(body, &in); err != nil || in.IP == "" {
-            http.Error(w, "invalid json/ip", 400); return
-        }
-        if err := run(fmt.Sprintf("ipset del gofw_white %s", in.IP)); err != nil {
-            http.Error(w, "failed", 500); return
-        }
+        if err := json.Unmarshal(body, &in); err != nil || in.IP == "" { http.Error(w, "invalid json/ip", 400); return }
+        if err := run(fmt.Sprintf("ipset del gofw_white %s", in.IP)); err != nil { http.Error(w, "failed", 500); return }
         w.WriteHeader(204)
     })
     mux.HandleFunc("/api/whitelisted", func(w http.ResponseWriter, r *http.Request) {
@@ -387,6 +399,36 @@ func main() {
         if err != nil { http.Error(w, err.Error(), 500); return }
         w.Header().Set("Content-Type", "application/json")
         json.NewEncoder(w).Encode(map[string]any{"set":"gofw_white","count":len(ips),"ips":ips})
+    })
+
+    // Config endpoints
+    mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
+        mu.Lock(); defer mu.Unlock()
+        if r.Method == "GET" {
+            w.Header().Set("Content-Type", "application/json")
+            json.NewEncoder(w).Encode(cfg); return
+        }
+        if r.Method == "PUT" {
+            var in Config
+            body, _ := io.ReadAll(r.Body)
+            if err := json.Unmarshal(body, &in); err != nil { http.Error(w, "invalid json", 400); return }
+            // validate basic
+            if in.DDOSDefense {
+                if in.TcpSynPerIp <= 0 || in.TcpSynBurst <= 0 || in.TcpConnPerIp <= 0 || in.UdpPpsPerIp <= 0 || in.UdpBurst <= 0 {
+                    http.Error(w, "values must be > 0", 400); return
+                }
+            }
+            // apply
+            prevDefense := cfg.DDOSDefense
+            cfg = in
+            if err := saveConfig(); err != nil { http.Error(w, "save failed", 500); return }
+            if prevDefense || cfg.DDOSDefense {
+                refreshDefenseAll()
+            }
+            w.Header().Set("Content-Type", "application/json")
+            json.NewEncoder(w).Encode(cfg); return
+        }
+        http.Error(w, "Method not allowed", 405)
     })
 
     log.Printf("GoPortPanel chạy tại http://0.0.0.0:%d/adminsetupfw/\n", port)
@@ -402,7 +444,7 @@ GOMOD
 cat > "$APP_DIR/frontend/package.json" <<'PKG'
 {
   "name": "ifw-ui",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "scripts": { "dev": "vite", "build": "vite build" },
   "dependencies": { "vue": "^3.4.0" },
   "devDependencies": { "vite": "^5.0.0", "@vitejs/plugin-vue": "^5.0.4" }
@@ -418,7 +460,10 @@ cat > "$APP_DIR/frontend/index.html" <<'HTML'
   <title>IFW PortPanel</title>
   <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;700&family=Montserrat:wght@600;900&display=swap" rel="stylesheet">
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-  <style>body{font-family:'Roboto',Arial,sans-serif;background:linear-gradient(135deg,#eaf6ff 0%,#f5f7fa 100%);min-height:100vh}</style>
+  <style>
+    body{font-family:'Roboto',Arial,sans-serif;background:linear-gradient(135deg,#eaf6ff 0%,#f5f7fa 100%);min-height:100vh}
+    .glass{backdrop-filter: blur(8px); background: rgba(255,255,255,0.85);}
+  </style>
 </head>
 <body>
   <div id="app"></div>
@@ -429,28 +474,37 @@ HTML
 
 cat > "$APP_DIR/frontend/src/App.vue" <<'VUE'
 <template>
-  <div class="container py-5" style="max-width: 950px;">
-    <div class="text-center mb-5">
-      <h1 class="fw-bold" style="font-family:'Montserrat',sans-serif;letter-spacing:1.5px;font-size:2.7rem;color:#2c72e8;text-shadow:0 4px 18px #a8c7fa;">
+  <div class="container py-5" style="max-width: 1100px;">
+    <div class="text-center mb-4">
+      <h1 class="fw-bold" style="font-family:'Montserrat',sans-serif;letter-spacing:1.2px;font-size:2.6rem;color:#2c72e8;text-shadow:0 4px 18px #a8c7fa;">
         IFW Forwarding Panel
       </h1>
-      <div class="small text-muted mt-2" style="font-size:1.07rem;letter-spacing:0.5px;">
-        Bảng điều khiển chuyển tiếp Port cho VPS
+      <div class="small text-muted mt-2" style="font-size:1.02rem;">
+        Forwarding + Anti-DDoS + Block/Whitelist + <b>Rate Config</b> • Thiết kế bởi <b>Tubetna</b>
       </div>
     </div>
-    <div class="card shadow-lg border-0 rounded-4 mb-5" style="background:rgba(255,255,255,0.98);">
+
+    <ul class="nav nav-pills justify-content-center gap-2 mb-4">
+      <li class="nav-item"><button class="nav-link" :class="tab==='rules'?'active':''" @click="switchTab('rules')"><i class="bi bi-diagram-3"></i> Forwarding</button></li>
+      <li class="nav-item"><button class="nav-link" :class="tab==='blocked'?'active':''" @click="switchTab('blocked')"><i class="bi bi-shield-x"></i> Blocked <span v-if="blocked.length" class="badge bg-danger ms-1">{{ blocked.length }}</span></button></li>
+      <li class="nav-item"><button class="nav-link" :class="tab==='whitelist'?'active':''" @click="switchTab('whitelist')"><i class="bi bi-shield-check"></i> Whitelist <span v-if="whitelisted.length" class="badge bg-success ms-1">{{ whitelisted.length }}</span></button></li>
+      <li class="nav-item"><button class="nav-link" :class="tab==='rate'?'active':''" @click="switchTab('rate')"><i class="bi bi-speedometer2"></i> Rate Config</button></li>
+    </ul>
+
+    <div v-if="alert.msg" class="alert" :class="alert.type" role="alert">{{ alert.msg }}</div>
+
+    <!-- RULES -->
+    <div v-show="tab==='rules'" class="card shadow-lg border-0 rounded-4 glass mb-4">
       <div class="card-body p-4">
         <form @submit.prevent="addRule" class="row g-3 align-items-end">
           <div class="col-md-2">
             <label class="form-label fw-semibold">Giao thức</label>
             <select v-model="newRule.proto" class="form-select rounded-3 border-1 shadow-sm">
-              <option value="tcp">TCP</option>
-              <option value="udp">UDP</option>
-              <option value="both">TCP+UDP</option>
+              <option value="tcp">TCP</option><option value="udp">UDP</option><option value="both">TCP+UDP</option>
             </select>
           </div>
           <div class="col-md-3">
-            <label class="form-label fw-semibold">Cổng nguồn</label>
+            <label class="form-label fw-semibold">Cổng VPS</label>
             <input v-model="newRule.fromPort" type="number" min="1" max="65535" class="form-control rounded-3 border-1 shadow-sm" required>
           </div>
           <div class="col-md-3">
@@ -462,7 +516,7 @@ cat > "$APP_DIR/frontend/src/App.vue" <<'VUE'
             <input v-model="newRule.toPort" type="number" min="1" max="65535" class="form-control rounded-3 border-1 shadow-sm" required>
           </div>
           <div class="col-md-2 d-grid">
-            <button type="submit" class="btn btn-primary rounded-3 shadow fw-bold" style="font-size:1.13rem;">
+            <button type="submit" class="btn btn-primary rounded-3 shadow fw-bold">
               <i class="bi bi-plus-circle"></i> Lưu Rule
             </button>
           </div>
@@ -470,53 +524,31 @@ cat > "$APP_DIR/frontend/src/App.vue" <<'VUE'
         <div v-if="error" class="alert alert-danger mt-3 py-2 px-3 rounded-3 shadow-sm" role="alert">{{ error }}</div>
       </div>
     </div>
-    <div class="card shadow-lg border-0 rounded-4" style="background:rgba(255,255,255,0.97);">
+
+    <div v-show="tab==='rules'" class="card shadow-lg border-0 rounded-4 glass">
       <div class="card-body p-4">
         <div class="d-flex justify-content-between align-items-center mb-3">
-          <h5 class="card-title fw-bold mb-0" style="font-size:1.18rem;">Danh sách Port Forwarding</h5>
-          <button class="btn btn-outline-primary btn-sm px-3 rounded-pill shadow-sm" @click="fetchRules">
-            <i class="bi bi-arrow-clockwise"></i> Làm mới
-          </button>
+          <h5 class="card-title fw-bold mb-0">Danh sách Port Forwarding</h5>
+          <button class="btn btn-outline-primary btn-sm px-3 rounded-pill shadow-sm" @click="fetchRules"><i class="bi bi-arrow-clockwise"></i> Làm mới</button>
         </div>
         <div class="table-responsive">
-          <table class="table align-middle table-hover mb-0" style="font-size:1.08rem;">
-            <thead class="table-light">
-              <tr>
-                <th>Giao thức</th>
-                <th>Cổng VPS</th>
-                <th>IP đích</th>
-                <th>Cổng đích</th>
-                <th>Thời gian</th>
-                <th>Trạng thái</th>
-                <th>Hành động</th>
-              </tr>
-            </thead>
+          <table class="table align-middle table-hover mb-0">
+            <thead class="table-light"><tr>
+              <th>Giao thức</th><th>Cổng VPS</th><th>IP đích</th><th>Cổng đích</th><th>Thời gian</th><th>Trạng thái</th><th>Hành động</th>
+            </tr></thead>
             <tbody>
-              <tr v-if="rules.length === 0">
-                <td colspan="7" class="text-center text-muted">Chưa có rule nào</td>
-              </tr>
+              <tr v-if="rules.length === 0"><td colspan="7" class="text-center text-muted">Chưa có rule nào</td></tr>
               <tr v-for="rule in rules" :key="rule.id" :class="{'table-warning':!rule.active}">
-                <td><span class="badge bg-primary bg-gradient rounded-pill px-3 shadow-sm" style="font-size:1em;">
-                    {{ rule.proto.toUpperCase() === 'BOTH' ? 'BOTH' : rule.proto.toUpperCase() }}
-                </span></td>
+                <td><span class="badge bg-primary bg-gradient rounded-pill px-3 shadow-sm">{{ rule.proto.toUpperCase()==='BOTH'?'BOTH':rule.proto.toUpperCase() }}</span></td>
                 <td class="fw-semibold">{{ rule.fromPort }}</td>
                 <td class="fw-semibold">{{ rule.toIp }}</td>
                 <td class="fw-semibold">{{ rule.toPort }}</td>
                 <td>{{ formatTime(rule.timeAdded) }}</td>
-                <td><span class="badge rounded-pill px-3" :class="rule.active ? 'bg-success' : 'bg-secondary'">
-                    {{ rule.active ? 'Hoạt động' : 'Tạm dừng' }}</span>
-                </td>
-                <td>
-                  <button @click="toggleRule(rule)" class="btn btn-sm me-2 shadow-sm"
-                    :class="rule.active ? 'btn-outline-warning' : 'btn-outline-success'">
-                    <i :class="rule.active ? 'bi bi-pause-fill' : 'bi bi-play-fill'"></i>
-                  </button>
-                  <button @click="editRule(rule)" class="btn btn-sm btn-outline-primary shadow-sm me-2">
-                    <i class="bi bi-pencil-square"></i>
-                  </button>
-                  <button @click="deleteRule(rule)" class="btn btn-sm btn-outline-danger shadow-sm">
-                    <i class="bi bi-trash"></i>
-                  </button>
+                <td><span class="badge rounded-pill px-3" :class="rule.active ? 'bg-success' : 'bg-secondary'">{{ rule.active ? 'Hoạt động' : 'Tạm dừng' }}</span></td>
+                <td class="d-flex gap-2">
+                  <button @click="toggleRule(rule)" class="btn btn-sm shadow-sm" :class="rule.active ? 'btn-outline-warning' : 'btn-outline-success'"><i :class="rule.active ? 'bi bi-pause-fill' : 'bi bi-play-fill'"></i></button>
+                  <button @click="editRule(rule)" class="btn btn-sm btn-outline-primary shadow-sm"><i class="bi bi-pencil-square"></i></button>
+                  <button @click="deleteRule(rule)" class="btn btn-sm btn-outline-danger shadow-sm"><i class="bi bi-trash"></i></button>
                 </td>
               </tr>
             </tbody>
@@ -524,122 +556,188 @@ cat > "$APP_DIR/frontend/src/App.vue" <<'VUE'
         </div>
       </div>
     </div>
-    <div class="text-center mt-4 small text-secondary">
-      <span style="letter-spacing:0.2px">© 2025 IFW Panel - Tuỳ chỉnh &amp; tối ưu bởi <b>Tubetna</b></span>
+
+    <!-- BLOCKED -->
+    <div v-show="tab==='blocked'" class="card shadow-lg border-0 rounded-4 glass">
+      <div class="card-body p-4">
+        <div class="d-flex justify-content-between mb-3">
+          <h5 class="fw-bold mb-0"><i class="bi bi-shield-x"></i> IP đang bị chặn</h5>
+          <div class="input-group" style="max-width:420px">
+            <input v-model="blockIp" type="text" class="form-control" placeholder="Nhập IPv4 để chặn (vd: 1.2.3.4)">
+            <button class="btn btn-danger" @click="blockIP"><i class="bi bi-plus"></i> Block</button>
+          </div>
+        </div>
+        <div class="row g-3">
+          <div class="col-12 col-md-6 col-lg-4" v-for="ip in blocked" :key="'b-'+ip">
+            <div class="card border-0 shadow-sm rounded-3"><div class="card-body d-flex justify-content-between align-items-center">
+              <span class="fw-semibold">{{ ip }}</span>
+              <button class="btn btn-sm btn-outline-secondary" @click="unblockIP(ip)"><i class="bi bi-unlock"></i> Unblock</button>
+            </div></div>
+          </div>
+          <div v-if="blocked.length===0" class="text-center text-muted">Không có IP nào bị chặn</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- WHITELIST -->
+    <div v-show="tab==='whitelist'" class="card shadow-lg border-0 rounded-4 glass">
+      <div class="card-body p-4">
+        <div class="d-flex justify-content-between mb-3">
+          <h5 class="fw-bold mb-0"><i class="bi bi-shield-check"></i> IP Whitelist (bỏ qua hạn chế)</h5>
+          <div class="input-group" style="max-width:420px">
+            <input v-model="whiteIp" type="text" class="form-control" placeholder="Nhập IPv4 để whitelist">
+            <button class="btn btn-success" @click="addWhitelist"><i class="bi bi-plus"></i> Add</button>
+          </div>
+        </div>
+        <div class="row g-3">
+          <div class="col-12 col-md-6 col-lg-4" v-for="ip in whitelisted" :key="'w-'+ip">
+            <div class="card border-0 shadow-sm rounded-3"><div class="card-body d-flex justify-content-between align-items-center">
+              <span class="fw-semibold">{{ ip }}</span>
+              <button class="btn btn-sm btn-outline-danger" @click="removeWhitelist(ip)"><i class="bi bi-x-circle"></i> Remove</button>
+            </div></div>
+          </div>
+          <div v-if="whitelisted.length===0" class="text-center text-muted">Chưa có IP nào whitelist</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- RATE CONFIG -->
+    <div v-show="tab==='rate'" class="card shadow-lg border-0 rounded-4 glass">
+      <div class="card-body p-4">
+        <div class="d-flex justify-content-between align-items-center mb-3">
+          <h5 class="fw-bold mb-0"><i class="bi bi-speedometer2"></i> Cấu hình Rate Limit & Chống DDoS</h5>
+          <div class="form-check form-switch">
+            <input class="form-check-input" type="checkbox" v-model="cfg.ddosDefense" id="swdef">
+            <label class="form-check-label" for="swdef">Bật chống DDoS</label>
+          </div>
+        </div>
+        <div class="row g-3">
+          <div class="col-md-4">
+            <label class="form-label">TCP SYN/giây mỗi IP</label>
+            <input type="number" min="10" v-model.number="cfg.tcpSynPerIp" class="form-control" :disabled="!cfg.ddosDefense">
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">TCP SYN Burst</label>
+            <input type="number" min="10" v-model.number="cfg.tcpSynBurst" class="form-control" :disabled="!cfg.ddosDefense">
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">TCP Kết nối đồng thời/IP</label>
+            <input type="number" min="10" v-model.number="cfg.tcpConnPerIp" class="form-control" :disabled="!cfg.ddosDefense">
+          </div>
+          <div class="col-md-6">
+            <label class="form-label">UDP PPS (NEW) mỗi IP</label>
+            <input type="number" min="100" v-model.number="cfg.udpPpsPerIp" class="form-control" :disabled="!cfg.ddosDefense">
+          </div>
+          <div class="col-md-6">
+            <label class="form-label">UDP Burst</label>
+            <input type="number" min="100" v-model.number="cfg.udpBurst" class="form-control" :disabled="!cfg.ddosDefense">
+          </div>
+        </div>
+        <div class="text-end mt-3">
+          <button class="btn btn-primary" @click="saveCfg"><i class="bi bi-save"></i> Lưu & Áp dụng</button>
+        </div>
+        <div class="small text-muted mt-2">Lưu ý: chỉ giới hạn <b>TCP SYN</b> và <b>UDP NEW</b>, flow đang chơi không bị ảnh hưởng. Whitelist sẽ bypass toàn bộ.</div>
+      </div>
     </div>
 
     <!-- Modal Edit -->
     <div v-if="editRuleData" class="modal d-block" tabindex="-1" style="background:#0007;">
       <div class="modal-dialog modal-dialog-centered"><div class="modal-content p-3">
-        <div class="modal-header">
-          <h5 class="modal-title">Sửa Rule</h5>
-          <button type="button" class="btn-close" @click="editRuleData=null"></button>
-        </div>
+        <div class="modal-header"><h5 class="modal-title">Sửa Rule</h5><button type="button" class="btn-close" @click="editRuleData=null"></button></div>
         <div class="modal-body">
           <form @submit.prevent="saveEditRule">
-            <div class="mb-2">
-              <label class="form-label">Giao thức</label>
-              <select v-model="editRuleData.proto" class="form-select">
-                <option value="tcp">TCP</option>
-                <option value="udp">UDP</option>
-                <option value="both">TCP+UDP</option>
-              </select>
+            <div class="mb-2"><label class="form-label">Giao thức</label>
+              <select v-model="editRuleData.proto" class="form-select"><option value="tcp">TCP</option><option value="udp">UDP</option><option value="both">TCP+UDP</option></select>
             </div>
-            <div class="mb-2">
-              <label class="form-label">Cổng nguồn</label>
-              <input v-model="editRuleData.fromPort" type="number" class="form-control" required min="1" max="65535">
-            </div>
-            <div class="mb-2">
-              <label class="form-label">IP đích</label>
-              <input v-model="editRuleData.toIp" type="text" class="form-control" required>
-            </div>
-            <div class="mb-2">
-              <label class="form-label">Cổng đích</label>
-              <input v-model="editRuleData.toPort" type="number" class="form-control" required min="1" max="65535">
-            </div>
-            <div class="modal-footer">
-              <button type="submit" class="btn btn-primary">Lưu</button>
-              <button type="button" class="btn btn-secondary" @click="editRuleData=null">Đóng</button>
-            </div>
+            <div class="mb-2"><label class="form-label">Cổng nguồn</label><input v-model="editRuleData.fromPort" type="number" class="form-control" required min="1" max="65535"></div>
+            <div class="mb-2"><label class="form-label">IP đích</label><input v-model="editRuleData.toIp" type="text" class="form-control" required></div>
+            <div class="mb-2"><label class="form-label">Cổng đích</label><input v-model="editRuleData.toPort" type="number" class="form-control" required min="1" max="65535"></div>
+            <div class="modal-footer"><button type="submit" class="btn btn-primary">Lưu</button><button type="button" class="btn btn-secondary" @click="editRuleData=null">Đóng</button></div>
           </form>
         </div>
       </div></div>
+    </div>
+
+    <div class="text-center mt-4 small text-secondary">
+      <span>© 2025 IFW Panel • <b>Forward mượt – Chặn rác nhẹ CPU</b></span>
     </div>
   </div>
 </template>
 
 <script setup>
 import { ref, onMounted } from 'vue'
+const tab = ref('rules')
 const rules = ref([])
 const error = ref("")
+const alert = ref({ msg: "", type: "alert-success" })
 const newRule = ref({ proto: 'tcp', fromPort: '', toIp: '', toPort: '' })
 const editRuleData = ref(null)
+const blocked = ref([]), whitelisted = ref([])
+const blockIp = ref(""), whiteIp = ref("")
+const cfg = ref({ ddosDefense:true, tcpSynPerIp:150, tcpSynBurst:300, tcpConnPerIp:250, udpPpsPerIp:8000, udpBurst:12000 })
 
-const fetchRules = async () => {
-  rules.value = await (await fetch('/api/rules')).json()
-}
+const ipv4ok = (ip) => /^\d{1,3}(\.\d{1,3}){3}$/.test(ip) && ip.split('.').every(n=> +n>=0 && +n<=255)
+const flash = (msg, type='alert-success') => { alert.value = { msg, type }; setTimeout(()=> alert.value.msg="", 2500) }
+const switchTab = (t) => { tab.value = t; if (t==='rules') fetchRules(); if (t==='blocked') fetchBlocked(); if (t==='whitelist') fetchWhitelisted(); if (t==='rate') fetchCfg() }
+
+const fetchRules = async () => { rules.value = await (await fetch('/api/rules')).json() }
 const addRule = async () => {
   error.value = ""
-  if (!newRule.value.fromPort || !newRule.value.toIp || !newRule.value.toPort) { error.value = "Vui lòng nhập đầy đủ thông tin!"; return }
-  if (isNaN(+newRule.value.fromPort) || +newRule.value.fromPort < 1 || +newRule.value.fromPort > 65535) { error.value = "Cổng nguồn phải là số từ 1 đến 65535!"; return }
-  if (isNaN(+newRule.value.toPort) || +newRule.value.toPort < 1 || +newRule.value.toPort > 65535) { error.value = "Cổng đích phải là số từ 1 đến 65535!"; return }
-  if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(newRule.value.toIp)) { error.value = "IP đích không hợp lệ!"; return }
-  const postData = { proto: newRule.value.proto, fromPort: String(newRule.value.fromPort), toIp: newRule.value.toIp, toPort: String(newRule.value.toPort) }
-  try {
-    const response = await fetch('/api/rules', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(postData) })
-    if (response.status === 409) { error.value = "Port này đã được forward!"; return }
-    if (!response.ok) { const msg = await response.text(); error.value = msg || "Không thể tạo rule"; return }
-    newRule.value = { proto: 'tcp', fromPort: '', toIp: '', toPort: '' }
-    fetchRules()
-  } catch (e) { error.value = "Lỗi kết nối server" }
+  if (!newRule.value.fromPort || !newRule.value.toIp || !newRule.value.toPort) { error.value="Vui lòng nhập đầy đủ thông tin!"; return }
+  if (isNaN(+newRule.value.fromPort) || +newRule.value.fromPort<1 || +newRule.value.fromPort>65535) { error.value="Cổng nguồn phải là số từ 1 đến 65535!"; return }
+  if (isNaN(+newRule.value.toPort) || +newRule.value.toPort<1 || +newRule.value.toPort>65535) { error.value="Cổng đích phải là số từ 1 đến 65535!"; return }
+  if (!ipv4ok(newRule.value.toIp)) { error.value="IP đích không hợp lệ!"; return }
+  const body = { proto:newRule.value.proto, fromPort:String(newRule.value.fromPort), toIp:newRule.value.toIp, toPort:String(newRule.value.toPort) }
+  const res = await fetch('/api/rules',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+  if (res.status===409){ error.value="Port này đã được forward!"; return }
+  if (!res.ok){ error.value=(await res.text())||"Không thể tạo rule"; return }
+  newRule.value = { proto:'tcp', fromPort:'', toIp:'', toPort:'' }
+  flash("Đã tạo rule!"); fetchRules()
 }
-const toggleRule = async (rule) => {
+const toggleRule = async (rule)=>{ const r=await fetch(`/api/rules/${rule.id}/toggle`,{method:'POST'}); flash(r.ok?"Đã cập nhật!":"Không thể cập nhật","alert-"+(r.ok?"success":"danger")); fetchRules() }
+const deleteRule = async (rule)=>{ if(confirm('Xóa rule này?')){ const r=await fetch(`/api/rules/${rule.id}`,{method:'DELETE'}); flash(r.ok?"Đã xóa!":"Không thể xóa","alert-"+(r.ok?"success":"danger")); fetchRules() } }
+const editRule = (rule)=>{ editRuleData.value = { ...rule } }
+const saveEditRule = async ()=> {
   error.value = ""
-  try {
-    const response = await fetch(`/api/rules/${rule.id}/toggle`, { method: 'POST' })
-    if (!response.ok) error.value = "Không thể cập nhật trạng thái rule"
-    fetchRules()
-  } catch (e) { error.value = "Lỗi kết nối server" }
+  if (!editRuleData.value.fromPort || !editRuleData.value.toIp || !editRuleData.value.toPort) { error.value="Vui lòng nhập đầy đủ thông tin!"; return }
+  if (isNaN(+editRuleData.value.fromPort) || +editRuleData.value.fromPort<1 || +editRuleData.value.fromPort>65535) { error.value="Cổng nguồn phải là số từ 1 đến 65535!"; return }
+  if (isNaN(+editRuleData.value.toPort) || +editRuleData.value.toPort<1 || +editRuleData.value.toPort>65535) { error.value="Cổng đích phải là số từ 1 đến 65535!"; return }
+  if (!ipv4ok(editRuleData.value.toIp)) { error.value="IP đích không hợp lệ!"; return }
+  const body = { proto:editRuleData.value.proto, fromPort:String(editRuleData.value.fromPort), toIp:editRuleData.value.toIp, toPort:String(editRuleData.value.toPort) }
+  const r = await fetch(`/api/rules/${editRuleData.value.id}`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+  if (r.status===409) { error.value="Port này đã được forward!"; return }
+  if (!r.ok) { error.value="Không thể cập nhật rule!"; return }
+  editRuleData.value=null; flash("Đã lưu rule!"); fetchRules()
 }
-const deleteRule = async (rule) => {
-  error.value = ""
-  if(confirm('Bạn có chắc chắn muốn xóa rule này?')) {
-    try {
-      const response = await fetch(`/api/rules/${rule.id}`, { method: 'DELETE' })
-      if (!response.ok) error.value = "Không thể xóa rule"
-      fetchRules()
-    } catch (e) { error.value = "Lỗi kết nối server" }
-  }
+
+const fetchBlocked = async ()=>{ const d = await (await fetch('/api/blocked')).json(); blocked.value = d.ips||[] }
+const blockIP = async ()=>{ if(!ipv4ok(blockIp.value)){ flash("IP không hợp lệ!","alert-danger"); return } const r=await fetch('/api/block',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip:blockIp.value})}); if(!r.ok){flash("Block thất bại!","alert-danger");return} blockIp.value=""; flash("Đã block IP!"); fetchBlocked() }
+const unblockIP = async (ip)=>{ const r=await fetch('/api/unblock',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip})}); flash(r.ok?"Đã unblock!":"Unblock thất bại!","alert-"+(r.ok?"success":"danger")); fetchBlocked() }
+
+const fetchWhitelisted = async ()=>{ const d = await (await fetch('/api/whitelisted')).json(); whitelisted.value = d.ips||[] }
+const addWhitelist = async ()=>{ if(!ipv4ok(whiteIp.value)){ flash("IP không hợp lệ!","alert-danger"); return } const r=await fetch('/api/whitelist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip:whiteIp.value})}); if(!r.ok){flash("Thêm whitelist thất bại!","alert-danger");return} whiteIp.value=""; flash("Đã whitelist IP!"); fetchWhitelisted() }
+const removeWhitelist = async (ip)=>{ const r=await fetch('/api/unwhitelist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip})}); flash(r.ok?"Đã gỡ whitelist!":"Gỡ whitelist thất bại!","alert-"+(r.ok?"success":"danger")); fetchWhitelisted() }
+
+const fetchCfg = async ()=>{ cfg.value = await (await fetch('/api/config')).json() }
+const saveCfg = async ()=>{
+  const r = await fetch('/api/config',{ method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(cfg.value) })
+  if (!r.ok) { flash("Lưu cấu hình thất bại!", "alert-danger"); return }
+  cfg.value = await r.json(); flash("Đã lưu & áp dụng cấu hình!","alert-success")
 }
-const editRule = (rule) => { editRuleData.value = { ...rule } }
-const saveEditRule = async () => {
-  error.value = ""
-  if (!editRuleData.value.fromPort || !editRuleData.value.toIp || !editRuleData.value.toPort) { error.value = "Vui lòng nhập đầy đủ thông tin!"; return }
-  if (isNaN(+editRuleData.value.fromPort) || +editRuleData.value.fromPort < 1 || +editRuleData.value.fromPort > 65535) { error.value = "Cổng nguồn phải là số từ 1 đến 65535!"; return }
-  if (isNaN(+editRuleData.value.toPort) || +editRuleData.value.toPort < 1 || +editRuleData.value.toPort > 65535) { error.value = "Cổng đích phải là số từ 1 đến 65535!"; return }
-  if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(editRuleData.value.toIp)) { error.value = "IP đích không hợp lệ!"; return }
-  const body = { proto: editRuleData.value.proto, fromPort: String(editRuleData.value.fromPort), toIp: editRuleData.value.toIp, toPort: String(editRuleData.value.toPort) }
-  try {
-    const response = await fetch(`/api/rules/${editRuleData.value.id}`, { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) })
-    if (response.status === 409) { error.value = "Port này đã được forward!"; return }
-    if (!response.ok) { error.value = "Không thể cập nhật rule!"; return }
-    editRuleData.value = null
-    fetchRules()
-  } catch (e) { error.value = "Lỗi kết nối server!" }
-}
-const formatTime = (t) => t ? new Date(t).toLocaleString('vi') : ''
-onMounted(fetchRules)
+
+const formatTime = (t)=> t? new Date(t).toLocaleString('vi') : ''
+onMounted(()=>{ fetchRules(); fetchBlocked(); fetchWhitelisted(); fetchCfg() })
 </script>
 
 <style>
 @import "https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css";
-body{background:linear-gradient(135deg,#eaf6ff 0%,#f5f7fa 100%);min-height:100vh}
 .card{border-radius:1.2rem!important;box-shadow:0 8px 28px rgba(60,130,255,0.07),0 1.5px 5px rgba(180,200,255,0.09)}
 .badge.bg-primary{background:linear-gradient(90deg,#3a89ff 0%,#38e2f1 100%)!important;color:#fff}
 .table th,.table td{vertical-align:middle}
-.btn{font-size:1.05rem}
 .btn:focus,.form-control:focus,.form-select:focus{box-shadow:0 0 0 0.18rem #8bcaff41!important;border-color:#7bb7f7!important}
-input[type=number]::-webkit-inner-spin-button,input[type=number]::-webkit-outer-spin-button{opacity:.6}
+.nav-pills .nav-link{border-radius:50rem;padding:.5rem 1rem}
+.nav-pills .nav-link.active{background:linear-gradient(90deg,#3a89ff 0%,#38e2f1 100%)}
+.alert{border:0;border-radius:1rem}
 </style>
 VUE
 
@@ -655,7 +753,7 @@ import vue from '@vitejs/plugin-vue'
 export default defineConfig({ root: '.', base: '/adminsetupfw/', plugins: [vue()], build: { outDir: 'dist', emptyOutDir: true } })
 VITE
 
-echo "==> [1] Cài Go, Node, iptables/ipset + tối ưu kernel/net"
+echo "==> [1] Cài Go/Node & tối ưu kernel/net + iptables/ipset"
 apt-get update -y
 apt-get install -y curl git iptables-persistent netfilter-persistent ipset ipset-persistent build-essential ca-certificates
 
@@ -696,7 +794,6 @@ SYSCTL
 sysctl --system
 
 echo "==> [2] Base rules: reset iptables + hooks raw/mangle + ipset"
-# Reset
 iptables -F || true
 iptables -t nat -F || true
 iptables -t mangle -F || true
@@ -710,32 +807,22 @@ iptables -P INPUT ACCEPT
 iptables -P OUTPUT ACCEPT
 iptables -P FORWARD ACCEPT
 
-# Drop INVALID sớm (trước conntrack)
 iptables -t mangle -I PREROUTING -m conntrack --ctstate INVALID -j DROP
-
-# Hạn chế ping forward
 iptables -I FORWARD -p icmp --icmp-type echo-request -m limit --limit 10/second --limit-burst 20 -j ACCEPT
 iptables -I FORWARD -p icmp --icmp-type echo-request -j DROP
-
-# NEW TCP mà không SYN -> drop
 iptables -I FORWARD -p tcp ! --syn -m conntrack --ctstate NEW -j DROP
 
-# ipset block & hook sớm
 ipset create gofw_block hash:ip family inet maxelem 200000 -exist
 ipset create gofw_white hash:ip family inet maxelem 100000 -exist
-iptables -t raw -C PREROUTING -m set --match-set gofw_block src -j DROP || \
-iptables -t raw -I PREROUTING -m set --match-set gofw_block src -j DROP
+iptables -t raw -C PREROUTING -m set --match-set gofw_block src -j DROP || iptables -t raw -I PREROUTING -m set --match-set gofw_block src -j DROP
 
-# Mở panel port
 iptables -I INPUT -p tcp --dport "$PANEL_PORT" -j ACCEPT || true
 iptables -I INPUT -p udp --dport "$PANEL_PORT" -j ACCEPT || true
 
-# Lưu lại
 netfilter-persistent save || true
 iptables-save > /etc/iptables/rules.v4
 ipset save > /etc/ipset/rules.v4
 
-# Tắt ufw/firewalld nếu có
 if command -v ufw >/dev/null 2>&1; then ufw disable || true; fi
 if systemctl is-active --quiet firewalld; then systemctl stop firewalld; systemctl disable firewalld; fi
 
@@ -754,12 +841,25 @@ if [ ! -f "$APP_DIR/backend/rules.json" ]; then
   echo '[]' > "$APP_DIR/backend/rules.json"
   chmod 666 "$APP_DIR/backend/rules.json"
 fi
+if [ ! -f "$APP_DIR/backend/config.json" ]; then
+  cat > "$APP_DIR/backend/config.json" <<JSON
+{
+  "ddosDefense": true,
+  "tcpSynPerIp": 150,
+  "tcpSynBurst": 300,
+  "tcpConnPerIp": 250,
+  "udpPpsPerIp": 8000,
+  "udpBurst": 12000
+}
+JSON
+  chmod 666 "$APP_DIR/backend/config.json"
+fi
 
 export PATH="/usr/local/go/bin:$PATH"
 go mod tidy
 go build -o portpanel main.go
 
-echo "==> [5] Tạo systemd service + cấu hình ngưỡng chống DDoS an toàn cho game"
+echo "==> [5] Tạo systemd service"
 cat > /etc/systemd/system/ifw.service <<EOF
 [Unit]
 Description=IFW PortPanel
@@ -767,6 +867,7 @@ After=network.target
 
 [Service]
 WorkingDirectory=$APP_DIR/backend
+# Env chỉ để default lần đầu; sau đó chỉnh trong web (config.json)
 Environment=DDOS_DEFENSE=1
 Environment=DDOS_TCP_SYN_PER_IP=150
 Environment=DDOS_TCP_SYN_BURST=300
@@ -786,13 +887,12 @@ systemctl enable --now ifw.service
 
 IP=$(curl -s4 https://api.ipify.org || echo "YOUR_IP")
 echo "==> HOÀN TẤT! Panel: http://$IP:$PANEL_PORT/adminsetupfw/"
-echo "   • Xem IP bị chặn:    curl http://$IP:$PANEL_PORT/api/blocked"
-echo "   • Chặn IP:           curl -X POST http://$IP:$PANEL_PORT/api/block -d '{\"ip\":\"1.2.3.4\"}'"
-echo "   • Gỡ chặn IP:        curl -X POST http://$IP:$PANEL_PORT/api/unblock -d '{\"ip\":\"1.2.3.4\"}'"
-echo "   • Thêm whitelist:    curl -X POST http://$IP:$PANEL_PORT/api/whitelist -d '{\"ip\":\"1.2.3.4\"}'"
-echo "   • Gỡ whitelist:      curl -X POST http://$IP:$PANEL_PORT/api/unwhitelist -d '{\"ip\":\"1.2.3.4\"}'"
-echo "   • Liệt kê whitelist: curl http://$IP:$PANEL_PORT/api/whitelisted"
+echo "   • Tab Forwarding: tạo/sửa/tạm dừng/xóa rule"
+echo "   • Tab Blocked:    block/unblock IP ngay lập tức"
+echo "   • Tab Whitelist:  thêm/gỡ IP bypass hạn chế"
+echo "   • Tab Rate Config: bật/tắt chống DDoS + chỉnh ngưỡng, áp dụng tức thì"
+echo "==> Tip: dữ liệu lưu tại $APP_DIR/backend/{rules.json,config.json}"
 
 systemctl restart ifw
-echo "==> DONE! Forwarding + Anti-DDoS"
+echo "==> DONE!"
 BASH
