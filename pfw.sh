@@ -1,205 +1,16 @@
-sudo bash -c 'PORT=2020; TMP=/tmp/ifw_allinone.sh; cat >"$TMP" <<'"'"'BASH'"'"'
+bash -s -- 2020 <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
+
 PANEL_PORT="${1:-2020}"
 APP_DIR="/opt/ifw"
 GO_VERSION="1.22.4"
 export DEBIAN_FRONTEND=noninteractive
 
-echo "==> [A] Sửa apt sources (comment backports) + apt update (allow suite/codename change)"
-mapfile -t BACKFILES < <(grep -RIl "backports" /etc/apt 2>/dev/null || true)
-if [ "${#BACKFILES[@]}" -gt 0 ]; then
-  for f in "${BACKFILES[@]}"; do
-    [ -f "$f.ifw.bak" ] || cp -a "$f" "$f.ifw.bak"
-    sed -ri '"'"'s@^(\s*deb(\s+\[.*\])?\s+[^#]*backports[^#]*)@# \1@'"'"' "$f" || true
-  done
-fi
-apt-get update -y -o Acquire::AllowReleaseInfoChange::Suite=true -o Acquire::AllowReleaseInfoChange::Codename=true || true
-
-echo "==> [B] Cài packages (ipset, iptables-persistent, netfilter-persistent, node, go, build tools)"
-apt-get install -y curl git iptables-persistent netfilter-persistent ipset ipset-persistent build-essential ca-certificates lsb-release gnupg2
-if ! command -v node >/dev/null 2>&1; then
-  curl -fsSL https://deb.nodesource.com/setup_18.x | bash - || true
-  apt-get install -y nodejs || true
-fi
-if ! command -v go >/dev/null 2>&1; then
-  curl -sL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go.tgz
-  tar -C /usr/local -xzf /tmp/go.tgz && rm -f /tmp/go.tgz
-  export PATH="/usr/local/go/bin:$PATH"
-  grep -q "/usr/local/go/bin" /root/.profile || echo '"'"'export PATH="/usr/local/go/bin:$PATH"'"'"' >> /root/.profile
-fi
-export PATH="/usr/local/go/bin:$PATH"
-
-echo "==> [C] Tối ưu sysctl + load modules cần thiết"
-cat > /etc/sysctl.d/99-portforward-opt.conf <<SYSCTL
-net.core.somaxconn=8192
-net.core.netdev_max_backlog=250000
-net.core.rmem_max=67108864
-net.core.wmem_max=67108864
-net.ipv4.tcp_window_scaling=1
-net.ipv4.tcp_congestion_control=bbr
-net.ipv4.tcp_fastopen=3
-net.ipv4.tcp_fin_timeout=7
-net.ipv4.tcp_mtu_probing=1
-net.ipv4.ip_forward=1
-net.ipv4.tcp_syncookies=1
-net.ipv4.tcp_max_syn_backlog=8192
-net.ipv4.tcp_synack_retries=2
-net.netfilter.nf_conntrack_max=1048576
-net.netfilter.nf_conntrack_udp_timeout=30
-net.netfilter.nf_conntrack_udp_timeout_stream=120
-net.netfilter.nf_conntrack_tcp_timeout_established=600
-net.ipv4.icmp_echo_ignore_broadcasts=1
-net.ipv4.icmp_ignore_bogus_error_responses=1
-net.ipv4.conf.all.rp_filter=1
-net.ipv4.conf.default.rp_filter=1
-SYSCTL
-sysctl --system
-
-for m in ip_set ip_set_hash_ip ip_set_hash_net ip_set_list_set xt_set xt_hashlimit nf_conntrack nf_conntrack_ipv4; do
-  modprobe "$m" 2>/dev/null || true
-done
-
-echo "==> [D] Reset iptables + ipset cơ bản + mở port panel"
-mkdir -p /etc/ipset /etc/iptables
-touch /etc/ipset/rules.v4
-
-iptables -F || true
-iptables -t nat -F || true
-iptables -t mangle -F || true
-iptables -t raw -F || true
-iptables -X || true
-iptables -t nat -X || true
-iptables -t mangle -X || true
-iptables -t raw -X || true
-iptables -P INPUT ACCEPT
-iptables -P OUTPUT ACCEPT
-iptables -P FORWARD ACCEPT
-
-iptables -t mangle -C PREROUTING -m conntrack --ctstate INVALID -j DROP 2>/dev/null || iptables -t mangle -I PREROUTING -m conntrack --ctstate INVALID -j DROP
-iptables -C FORWARD -p icmp --icmp-type echo-request -m limit --limit 10/second --limit-burst 20 -j ACCEPT 2>/dev/null || iptables -I FORWARD -p icmp --icmp-type echo-request -m limit --limit 10/second --limit-burst 20 -j ACCEPT
-iptables -C FORWARD -p icmp --icmp-type echo-request -j DROP 2>/dev/null || iptables -I FORWARD -p icmp --icmp-type echo-request -j DROP
-iptables -C FORWARD -p tcp ! --syn -m conntrack --ctstate NEW -j DROP 2>/dev/null || iptables -I FORWARD -p tcp ! --syn -m conntrack --ctstate NEW -j DROP
-
-ipset create gofw_block hash:ip family inet maxelem 200000 -exist
-ipset create gofw_white hash:ip family inet maxelem 100000 -exist
-iptables -t raw -C PREROUTING -m set --match-set gofw_block src -j DROP 2>/dev/null || iptables -t raw -I PREROUTING -m set --match-set gofw_block src -j DROP
-
-iptables -C INPUT -p tcp --dport "$PANEL_PORT" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$PANEL_PORT" -j ACCEPT
-iptables -C INPUT -p udp --dport "$PANEL_PORT" -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport "$PANEL_PORT" -j ACCEPT
-
-netfilter-persistent save || true
-iptables-save > /etc/iptables/rules.v4
-ipset save > /etc/ipset/rules.v4
-
-if command -v ufw >/dev/null 2>&1; then ufw disable || true; fi
-if systemctl is-active --quiet firewalld; then systemctl stop firewalld; systemctl disable firewalld; fi
-
-echo "==> [E] Sinh mã nguồn backend+frontend (UI đẹp + Rate Config + Block/Whitelist + /api/blocked)"
+echo "==> [0] Tạo mã nguồn backend + frontend (có Rate Config UI)"
 mkdir -p "$APP_DIR/backend" "$APP_DIR/frontend/src"
 
-cat > "$APP_DIR/backend/main.go" <<'"'"'GO'"'"'
-<PLACE_GO_CODE_HERE>
-GO
-
-cat > "$APP_DIR/backend/go.mod" <<'"'"'GOMOD'"'"'
-module ifw
-go 1.22
-GOMOD
-
-cat > "$APP_DIR/frontend/package.json" <<'"'"'PKG'"'"'
-{
-  "name": "ifw-ui",
-  "version": "1.1.0",
-  "scripts": { "dev": "vite", "build": "vite build" },
-  "dependencies": { "vue": "^3.4.0" },
-  "devDependencies": { "vite": "^5.0.0", "@vitejs/plugin-vue": "^5.0.4" }
-}
-PKG
-
-cat > "$APP_DIR/frontend/index.html" <<'"'"'HTML'"'"'
-<PLACE_INDEX_HTML_HERE>
-HTML
-
-cat > "$APP_DIR/frontend/src/App.vue" <<'"'"'VUE'"'"'
-<PLACE_APP_VUE_HERE>
-VUE
-
-cat > "$APP_DIR/frontend/src/main.js" <<'"'"'JS'"'"'
-import { createApp } from "vue"
-import App from "./App.vue"
-createApp(App).mount("#app")
-JS
-
-cat > "$APP_DIR/frontend/vite.config.js" <<'"'"'VITE'"'"'
-import { defineConfig } from "vite"
-import vue from "@vitejs/plugin-vue"
-export default defineConfig({ root: ".", base: "/adminsetupfw/", plugins: [vue()], build: { outDir: "dist", emptyOutDir: true } })
-VITE
-
-echo "==> [F] Build frontend + backend"
-cd "$APP_DIR/frontend"
-npm install
-npm run build
-
-cd "$APP_DIR/backend"
-rm -rf public
-mkdir -p public
-cp -r "$APP_DIR/frontend/dist/"* public/ || true
-
-[ -f "$APP_DIR/backend/rules.json" ] || { echo "[]" > "$APP_DIR/backend/rules.json"; chmod 666 "$APP_DIR/backend/rules.json"; }
-[ -f "$APP_DIR/backend/config.json" ] || cat > "$APP_DIR/backend/config.json" <<JSON
-{
-  "ddosDefense": true,
-  "tcpSynPerIp": 150,
-  "tcpSynBurst": 300,
-  "tcpConnPerIp": 250,
-  "udpPpsPerIp": 8000,
-  "udpBurst": 12000
-}
-JSON
-chmod 666 "$APP_DIR/backend/config.json"
-
-go mod tidy
-(go build -o portpanel main.go) || (/usr/local/go/bin/go build -o portpanel main.go)
-
-echo "==> [G] Tạo & khởi động systemd service"
-cat > /etc/systemd/system/ifw.service <<EOF
-[Unit]
-Description=IFW PortPanel
-After=network.target
-
-[Service]
-WorkingDirectory=$APP_DIR/backend
-Environment=DDOS_DEFENSE=1
-Environment=DDOS_TCP_SYN_PER_IP=150
-Environment=DDOS_TCP_SYN_BURST=300
-Environment=DDOS_TCP_CONN_PER_IP=250
-Environment=DDOS_UDP_PPS_PER_IP=8000
-Environment=DDOS_UDP_BURST=12000
-ExecStart=$APP_DIR/backend/portpanel --port $PANEL_PORT
-Restart=on-failure
-User=root
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable --now ifw.service || true
-
-IP=$(curl -s4 https://api.ipify.org || echo "YOUR_IP")
-echo "==> HOÀN TẤT! Truy cập: http://$IP:$PANEL_PORT/adminsetupfw/"
-echo "   • Forwarding: tạo/sửa/tạm dừng/xóa"
-echo "   • Block/Whitelist: /api/block, /api/unblock, /api/blocked, /api/whitelist, /api/unwhitelist, /api/whitelisted"
-echo "   • Rate Config UI: /api/config (Bật/Tắt, SYN/giây, Burst, Conn/IP, UDP PPS/Burst)"
-echo "   • File lưu: $APP_DIR/backend/{rules.json,config.json}"
-
-systemctl restart ifw || true
-echo "==> DONE!"
-BASH
-# Nhúng code thực tế vào placeholders:
-sed -i "0,/<PLACE_GO_CODE_HERE>/s//$(sed -e "s/[\/&]/\\\\&/g" <<'"'"'GO'"'"'
+cat > "$APP_DIR/backend/main.go" <<'GO'
 package main
 
 import (
@@ -397,7 +208,9 @@ func saveConfig() error {
 }
 
 func loadConfig() {
+    // Base defaults
     cfg = defaultConfig()
+    // Allow env override on first boot
     cfg.TcpSynPerIp  = getenvInt("DDOS_TCP_SYN_PER_IP", cfg.TcpSynPerIp)
     cfg.TcpSynBurst  = getenvInt("DDOS_TCP_SYN_BURST",  cfg.TcpSynBurst)
     cfg.TcpConnPerIp = getenvInt("DDOS_TCP_CONN_PER_IP",cfg.TcpConnPerIp)
@@ -436,6 +249,7 @@ func listIPSet(name string) ([]string, error) {
 type ipReq struct{ IP string `json:"ip"` }
 
 func refreshDefenseAll() {
+    // Re-apply defense for all active rules to take new limits immediately
     for _, r := range rules {
         if r.Active {
             removeDefense(r)
@@ -465,6 +279,7 @@ func main() {
     mux.Handle("/adminsetupfw/assets/", http.StripPrefix("/adminsetupfw/", http.FileServer(http.Dir("public"))))
     mux.Handle("/adminsetupfw/", http.StripPrefix("/adminsetupfw/", http.FileServer(http.Dir("public"))))
 
+    // CRUD rules
     mux.HandleFunc("/api/rules", func(w http.ResponseWriter, r *http.Request) {
         mu.Lock(); defer mu.Unlock()
         if r.Method == "GET" {
@@ -492,7 +307,6 @@ func main() {
         }
         http.Error(w, "Method not allowed", 405)
     })
-
     mux.HandleFunc("/api/rules/", func(w http.ResponseWriter, r *http.Request) {
         mu.Lock(); defer mu.Unlock()
         id := strings.TrimPrefix(r.URL.Path, "/api/rules/")
@@ -537,8 +351,7 @@ func main() {
         http.Error(w, "Method not allowed", 405)
     })
 
-    type ipReq struct{ IP string `json:"ip"` }
-
+    // Block / Unblock / List blocked
     mux.HandleFunc("/api/block", func(w http.ResponseWriter, r *http.Request) {
         if r.Method != "POST" { http.Error(w, "Method not allowed", 405); return }
         var in ipReq
@@ -547,7 +360,6 @@ func main() {
         if err := run(fmt.Sprintf("ipset add gofw_block %s -exist", in.IP)); err != nil { http.Error(w, "failed", 500); return }
         w.WriteHeader(204)
     })
-
     mux.HandleFunc("/api/unblock", func(w http.ResponseWriter, r *http.Request) {
         if r.Method != "POST" { http.Error(w, "Method not allowed", 405); return }
         var in ipReq
@@ -556,7 +368,6 @@ func main() {
         if err := run(fmt.Sprintf("ipset del gofw_block %s", in.IP)); err != nil { http.Error(w, "failed", 500); return }
         w.WriteHeader(204)
     })
-
     mux.HandleFunc("/api/blocked", func(w http.ResponseWriter, r *http.Request) {
         if r.Method != "GET" { http.Error(w, "Method not allowed", 405); return }
         ips, err := listIPSet("gofw_block")
@@ -565,6 +376,7 @@ func main() {
         json.NewEncoder(w).Encode(map[string]any{"set":"gofw_block","count":len(ips),"ips":ips})
     })
 
+    // Whitelist
     mux.HandleFunc("/api/whitelist", func(w http.ResponseWriter, r *http.Request) {
         if r.Method != "POST" { http.Error(w, "Method not allowed", 405); return }
         var in ipReq
@@ -573,7 +385,6 @@ func main() {
         if err := run(fmt.Sprintf("ipset add gofw_white %s -exist", in.IP)); err != nil { http.Error(w, "failed", 500); return }
         w.WriteHeader(204)
     })
-
     mux.HandleFunc("/api/unwhitelist", func(w http.ResponseWriter, r *http.Request) {
         if r.Method != "POST" { http.Error(w, "Method not allowed", 405); return }
         var in ipReq
@@ -582,7 +393,6 @@ func main() {
         if err := run(fmt.Sprintf("ipset del gofw_white %s", in.IP)); err != nil { http.Error(w, "failed", 500); return }
         w.WriteHeader(204)
     })
-
     mux.HandleFunc("/api/whitelisted", func(w http.ResponseWriter, r *http.Request) {
         if r.Method != "GET" { http.Error(w, "Method not allowed", 405); return }
         ips, err := listIPSet("gofw_white")
@@ -591,6 +401,7 @@ func main() {
         json.NewEncoder(w).Encode(map[string]any{"set":"gofw_white","count":len(ips),"ips":ips})
     })
 
+    // Config endpoints
     mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
         mu.Lock(); defer mu.Unlock()
         if r.Method == "GET" {
@@ -601,11 +412,13 @@ func main() {
             var in Config
             body, _ := io.ReadAll(r.Body)
             if err := json.Unmarshal(body, &in); err != nil { http.Error(w, "invalid json", 400); return }
+            // validate basic
             if in.DDOSDefense {
                 if in.TcpSynPerIp <= 0 || in.TcpSynBurst <= 0 || in.TcpConnPerIp <= 0 || in.UdpPpsPerIp <= 0 || in.UdpBurst <= 0 {
                     http.Error(w, "values must be > 0", 400); return
                 }
             }
+            // apply
             prevDefense := cfg.DDOSDefense
             cfg = in
             if err := saveConfig(); err != nil { http.Error(w, "save failed", 500); return }
@@ -618,13 +431,27 @@ func main() {
         http.Error(w, "Method not allowed", 405)
     })
 
-    log.Printf("GoPortPanel chạy tại http://0.0.0.0:%d/adminsetupfw/\\n", port)
+    log.Printf("GoPortPanel chạy tại http://0.0.0.0:%d/adminsetupfw/\n", port)
     http.ListenAndServe(fmt.Sprintf("0.0.0.0:%d", port), mux)
 }
 GO
-)" "$TMP"
 
-sed -i "0,/<PLACE_INDEX_HTML_HERE>/s//$(sed -e "s/[\/&]/\\\\&/g" <<'"'"'HTML'"'"'
+cat > "$APP_DIR/backend/go.mod" <<'GOMOD'
+module ifw
+go 1.22
+GOMOD
+
+cat > "$APP_DIR/frontend/package.json" <<'PKG'
+{
+  "name": "ifw-ui",
+  "version": "1.1.0",
+  "scripts": { "dev": "vite", "build": "vite build" },
+  "dependencies": { "vue": "^3.4.0" },
+  "devDependencies": { "vite": "^5.0.0", "@vitejs/plugin-vue": "^5.0.4" }
+}
+PKG
+
+cat > "$APP_DIR/frontend/index.html" <<'HTML'
 <!DOCTYPE html>
 <html lang="vi">
 <head>
@@ -634,7 +461,7 @@ sed -i "0,/<PLACE_INDEX_HTML_HERE>/s//$(sed -e "s/[\/&]/\\\\&/g" <<'"'"'HTML'"'"
   <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;700&family=Montserrat:wght@600;900&display=swap" rel="stylesheet">
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
   <style>
-    body{font-family:\x27Roboto\x27,Arial,sans-serif;background:linear-gradient(135deg,#eaf6ff 0%,#f5f7fa 100%);min-height:100vh}
+    body{font-family:'Roboto',Arial,sans-serif;background:linear-gradient(135deg,#eaf6ff 0%,#f5f7fa 100%);min-height:100vh}
     .glass{backdrop-filter: blur(8px); background: rgba(255,255,255,0.85);}
   </style>
 </head>
@@ -644,9 +471,8 @@ sed -i "0,/<PLACE_INDEX_HTML_HERE>/s//$(sed -e "s/[\/&]/\\\\&/g" <<'"'"'HTML'"'"
 </body>
 </html>
 HTML
-)" "$TMP"
 
-sed -i "0,/<PLACE_APP_VUE_HERE>/s//$(sed -e "s/[\/&]/\\\\&/g" <<'"'"'VUE'"'"'
+cat > "$APP_DIR/frontend/src/App.vue" <<'VUE'
 <template>
   <div class="container py-5" style="max-width: 1100px;">
     <div class="text-center mb-4">
@@ -839,22 +665,22 @@ sed -i "0,/<PLACE_APP_VUE_HERE>/s//$(sed -e "s/[\/&]/\\\\&/g" <<'"'"'VUE'"'"'
 </template>
 
 <script setup>
-import { ref, onMounted } from "vue"
-const tab = ref("rules")
+import { ref, onMounted } from 'vue'
+const tab = ref('rules')
 const rules = ref([])
 const error = ref("")
 const alert = ref({ msg: "", type: "alert-success" })
-const newRule = ref({ proto: "tcp", fromPort: "", toIp: "", toPort: "" })
+const newRule = ref({ proto: 'tcp', fromPort: '', toIp: '', toPort: '' })
 const editRuleData = ref(null)
 const blocked = ref([]), whitelisted = ref([])
 const blockIp = ref(""), whiteIp = ref("")
 const cfg = ref({ ddosDefense:true, tcpSynPerIp:150, tcpSynBurst:300, tcpConnPerIp:250, udpPpsPerIp:8000, udpBurst:12000 })
 
-const ipv4ok = (ip) => /^\\d{1,3}(\\.\\d{1,3}){3}$/.test(ip) && ip.split(".").every(n=> +n>=0 && +n<=255)
-const flash = (msg, type="alert-success") => { alert.value = { msg, type }; setTimeout(()=> alert.value.msg="", 2500) }
-const switchTab = (t) => { tab.value = t; if (t==="rules") fetchRules(); if (t==="blocked") fetchBlocked(); if (t==="whitelist") fetchWhitelisted(); if (t==="rate") fetchCfg() }
+const ipv4ok = (ip) => /^\d{1,3}(\.\d{1,3}){3}$/.test(ip) && ip.split('.').every(n=> +n>=0 && +n<=255)
+const flash = (msg, type='alert-success') => { alert.value = { msg, type }; setTimeout(()=> alert.value.msg="", 2500) }
+const switchTab = (t) => { tab.value = t; if (t==='rules') fetchRules(); if (t==='blocked') fetchBlocked(); if (t==='whitelist') fetchWhitelisted(); if (t==='rate') fetchCfg() }
 
-const fetchRules = async () => { rules.value = await (await fetch("/api/rules")).json() }
+const fetchRules = async () => { rules.value = await (await fetch('/api/rules')).json() }
 const addRule = async () => {
   error.value = ""
   if (!newRule.value.fromPort || !newRule.value.toIp || !newRule.value.toPort) { error.value="Vui lòng nhập đầy đủ thông tin!"; return }
@@ -862,14 +688,14 @@ const addRule = async () => {
   if (isNaN(+newRule.value.toPort) || +newRule.value.toPort<1 || +newRule.value.toPort>65535) { error.value="Cổng đích phải là số từ 1 đến 65535!"; return }
   if (!ipv4ok(newRule.value.toIp)) { error.value="IP đích không hợp lệ!"; return }
   const body = { proto:newRule.value.proto, fromPort:String(newRule.value.fromPort), toIp:newRule.value.toIp, toPort:String(newRule.value.toPort) }
-  const res = await fetch("/api/rules",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)})
+  const res = await fetch('/api/rules',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
   if (res.status===409){ error.value="Port này đã được forward!"; return }
   if (!res.ok){ error.value=(await res.text())||"Không thể tạo rule"; return }
-  newRule.value = { proto:"tcp", fromPort:"", toIp:"", toPort:"" }
+  newRule.value = { proto:'tcp', fromPort:'', toIp:'', toPort:'' }
   flash("Đã tạo rule!"); fetchRules()
 }
-const toggleRule = async (rule)=>{ const r=await fetch(`/api/rules/${rule.id}/toggle`,{method:"POST"}); flash(r.ok?"Đã cập nhật!":"Không thể cập nhật","alert-"+(r.ok?"success":"danger")); fetchRules() }
-const deleteRule = async (rule)=>{ if(confirm("Xóa rule này?")){ const r=await fetch(`/api/rules/${rule.id}`,{method:"DELETE"}); flash(r.ok?"Đã xóa!":"Không thể xóa","alert-"+(r.ok?"success":"danger")); fetchRules() } }
+const toggleRule = async (rule)=>{ const r=await fetch(`/api/rules/${rule.id}/toggle`,{method:'POST'}); flash(r.ok?"Đã cập nhật!":"Không thể cập nhật","alert-"+(r.ok?"success":"danger")); fetchRules() }
+const deleteRule = async (rule)=>{ if(confirm('Xóa rule này?')){ const r=await fetch(`/api/rules/${rule.id]}`,{method:'DELETE'}); flash(r.ok?"Đã xóa!":"Không thể xóa","alert-"+(r.ok?"success":"danger")); fetchRules() } }
 const editRule = (rule)=>{ editRuleData.value = { ...rule } }
 const saveEditRule = async ()=> {
   error.value = ""
@@ -878,24 +704,28 @@ const saveEditRule = async ()=> {
   if (isNaN(+editRuleData.value.toPort) || +editRuleData.value.toPort<1 || +editRuleData.value.toPort>65535) { error.value="Cổng đích phải là số từ 1 đến 65535!"; return }
   if (!ipv4ok(editRuleData.value.toIp)) { error.value="IP đích không hợp lệ!"; return }
   const body = { proto:editRuleData.value.proto, fromPort:String(editRuleData.value.fromPort), toIp:editRuleData.value.toIp, toPort:String(editRuleData.value.toPort) }
-  const r = await fetch(`/api/rules/${editRuleData.value.id}`,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)})
+  const r = await fetch(`/api/rules/${editRuleData.value.id}`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
   if (r.status===409) { error.value="Port này đã được forward!"; return }
   if (!r.ok) { error.value="Không thể cập nhật rule!"; return }
   editRuleData.value=null; flash("Đã lưu rule!"); fetchRules()
 }
 
-const fetchBlocked = async ()=>{ const d = await (await fetch("/api/blocked")).json(); blocked.value = d.ips||[] }
-const blockIP = async ()=>{ if(!ipv4ok(blockIp.value)){ flash("IP không hợp lệ!","alert-danger"); return } const r=await fetch("/api/block",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ip:blockIp.value})}); if(!r.ok){flash("Block thất bại!","alert-danger");return} blockIp.value=""; flash("Đã block IP!"); fetchBlocked() }
-const unblockIP = async (ip)=>{ const r=await fetch("/api/unblock",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ip})}); flash(r.ok?"Đã unblock!":"Unblock thất bại!","alert-"+(r.ok?"success":"danger")); fetchBlocked() }
+const fetchBlocked = async ()=>{ const d = await (await fetch('/api/blocked')).json(); blocked.value = d.ips||[] }
+const blockIP = async ()=>{ if(!ipv4ok(blockIp.value)){ flash("IP không hợp lệ!","alert-danger"); return } const r=await fetch('/api/block',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip:blockIp.value})}); if(!r.ok){flash("Block thất bại!","alert-danger");return} blockIp.value=""; flash("Đã block IP!"); fetchBlocked() }
+const unblockIP = async (ip)=>{ const r=await fetch('/api/unblock',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip})}); flash(r.ok?"Đã unblock!":"Unblock thất bại!","alert-"+(r.ok?"success":"danger")); fetchBlocked() }
 
-const fetchWhitelisted = async ()=>{ const d = await (await fetch("/api/whitelisted")).json(); whitelisted.value = d.ips||[] }
-const addWhitelist = async ()=>{ if(!ipv4ok(whiteIp.value)){ flash("IP không hợp lệ!","alert-danger"); return } const r=await fetch("/api/whitelist",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ip:whiteIp.value})}); if(!r.ok){flash("Thêm whitelist thất bại!","alert-danger");return} whiteIp.value=""; flash("Đã whitelist IP!"); fetchWhitelisted() }
-const removeWhitelist = async (ip)=>{ const r=await fetch("/api/unwhitelist",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ip})}); flash(r.ok?"Đã gỡ whitelist!":"Gỡ whitelist thất bại!","alert-"+(r.ok?"success":"danger")); fetchWhitelisted() }
+const fetchWhitelisted = async ()=>{ const d = await (await fetch('/api/whitelisted')).json(); whitelisted.value = d.ips||[] }
+const addWhitelist = async ()=>{ if(!ipv4ok(whiteIp.value)){ flash("IP không hợp lệ!","alert-danger"); return } const r=await fetch('/api/whitelist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip:whiteIp.value})}); if(!r.ok){flash("Thêm whitelist thất bại!","alert-danger");return} whiteIp.value=""; flash("Đã whitelist IP!"); fetchWhitelisted() }
+const removeWhitelist = async (ip)=>{ const r=await fetch('/api/unwhitelist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip})}); flash(r.ok?"Đã gỡ whitelist!":"Gỡ whitelist thất bại!","alert-"+(r.ok?"success":"danger")); fetchWhitelisted() }
 
-const fetchCfg = async ()=>{ cfg.value = await (await fetch("/api/config")).json() }
-const saveCfg = async ()=>{ const r = await fetch("/api/config",{ method:"PUT", headers:{"Content-Type":"application/json"}, body: JSON.stringify(cfg.value) }); if (!r.ok) { flash("Lưu cấu hình thất bại!", "alert-danger"); return } cfg.value = await r.json(); flash("Đã lưu & áp dụng cấu hình!","alert-success") }
+const fetchCfg = async ()=>{ cfg.value = await (await fetch('/api/config')).json() }
+const saveCfg = async ()=>{
+  const r = await fetch('/api/config',{ method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(cfg.value) })
+  if (!r.ok) { flash("Lưu cấu hình thất bại!", "alert-danger"); return }
+  cfg.value = await r.json(); flash("Đã lưu & áp dụng cấu hình!","alert-success")
+}
 
-const formatTime = (t)=> t? new Date(t).toLocaleString("vi") : ""
+const formatTime = (t)=> t? new Date(t).toLocaleString('vi') : ''
 onMounted(()=>{ fetchRules(); fetchBlocked(); fetchWhitelisted(); fetchCfg() })
 </script>
 
@@ -910,7 +740,159 @@ onMounted(()=>{ fetchRules(); fetchBlocked(); fetchWhitelisted(); fetchCfg() })
 .alert{border:0;border-radius:1rem}
 </style>
 VUE
-)" "$TMP"
 
-bash "$TMP" "$PORT"
-'
+cat > "$APP_DIR/frontend/src/main.js" <<'JS'
+import { createApp } from 'vue'
+import App from './App.vue'
+createApp(App).mount('#app')
+JS
+
+cat > "$APP_DIR/frontend/vite.config.js" <<'VITE'
+import { defineConfig } from 'vite'
+import vue from '@vitejs/plugin-vue'
+export default defineConfig({ root: '.', base: '/adminsetupfw/', plugins: [vue()], build: { outDir: 'dist', emptyOutDir: true } })
+VITE
+
+echo "==> [1] Cài Go/Node & tối ưu kernel/net + iptables/ipset"
+apt-get update -y
+apt-get install -y curl git iptables-persistent netfilter-persistent ipset ipset-persistent build-essential ca-certificates
+
+if ! command -v go >/dev/null 2>&1; then
+  curl -sL https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz | tar -xz -C /usr/local
+  export PATH="/usr/local/go/bin:$PATH"
+  grep -q '/usr/local/go/bin' /root/.profile || echo 'export PATH="/usr/local/go/bin:$PATH"' >> /root/.profile
+fi
+if ! command -v node >/dev/null 2>&1; then
+  curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
+  apt-get install -y nodejs
+fi
+
+# Sysctl tối ưu + chống SYN flood + conntrack
+cat > /etc/sysctl.d/99-portforward-opt.conf <<SYSCTL
+net.core.somaxconn=8192
+net.core.netdev_max_backlog=250000
+net.core.rmem_max=67108864
+net.core.wmem_max=67108864
+net.ipv4.tcp_window_scaling=1
+net.ipv4.tcp_congestion_control=bbr
+net.ipv4.tcp_fastopen=3
+net.ipv4.tcp_fin_timeout=7
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.ip_forward=1
+net.ipv4.tcp_syncookies=1
+net.ipv4.tcp_max_syn_backlog=8192
+net.ipv4.tcp_synack_retries=2
+net.netfilter.nf_conntrack_max=1048576
+net.netfilter.nf_conntrack_udp_timeout=30
+net.netfilter.nf_conntrack_udp_timeout_stream=120
+net.netfilter.nf_conntrack_tcp_timeout_established=600
+net.ipv4.icmp_echo_ignore_broadcasts=1
+net.ipv4.icmp_ignore_bogus_error_responses=1
+net.ipv4.conf.all.rp_filter=1
+net.ipv4.conf.default.rp_filter=1
+SYSCTL
+sysctl --system
+
+echo "==> [2] Base rules: reset iptables + hooks raw/mangle + ipset"
+iptables -F || true
+iptables -t nat -F || true
+iptables -t mangle -F || true
+iptables -t raw -F || true
+iptables -X || true
+iptables -t nat -X || true
+iptables -t mangle -X || true
+iptables -t raw -X || true
+
+iptables -P INPUT ACCEPT
+iptables -P OUTPUT ACCEPT
+iptables -P FORWARD ACCEPT
+
+iptables -t mangle -I PREROUTING -m conntrack --ctstate INVALID -j DROP
+iptables -I FORWARD -p icmp --icmp-type echo-request -m limit --limit 10/second --limit-burst 20 -j ACCEPT
+iptables -I FORWARD -p icmp --icmp-type echo-request -j DROP
+iptables -I FORWARD -p tcp ! --syn -m conntrack --ctstate NEW -j DROP
+
+ipset create gofw_block hash:ip family inet maxelem 200000 -exist
+ipset create gofw_white hash:ip family inet maxelem 100000 -exist
+iptables -t raw -C PREROUTING -m set --match-set gofw_block src -j DROP || iptables -t raw -I PREROUTING -m set --match-set gofw_block src -j DROP
+
+iptables -I INPUT -p tcp --dport "$PANEL_PORT" -j ACCEPT || true
+iptables -I INPUT -p udp --dport "$PANEL_PORT" -j ACCEPT || true
+
+netfilter-persistent save || true
+iptables-save > /etc/iptables/rules.v4
+ipset save > /etc/ipset/rules.v4
+
+if command -v ufw >/dev/null 2>&1; then ufw disable || true; fi
+if systemctl is-active --quiet firewalld; then systemctl stop firewalld; systemctl disable firewalld; fi
+
+echo "==> [3] Build frontend"
+cd "$APP_DIR/frontend"
+npm install
+npm run build
+
+echo "==> [4] Build backend Go"
+cd "$APP_DIR/backend"
+rm -rf public
+mkdir -p public
+cp -r "$APP_DIR/frontend/dist/"* public/ || true
+
+if [ ! -f "$APP_DIR/backend/rules.json" ]; then
+  echo '[]' > "$APP_DIR/backend/rules.json"
+  chmod 666 "$APP_DIR/backend/rules.json"
+fi
+if [ ! -f "$APP_DIR/backend/config.json" ]; then
+  cat > "$APP_DIR/backend/config.json" <<JSON
+{
+  "ddosDefense": true,
+  "tcpSynPerIp": 150,
+  "tcpSynBurst": 300,
+  "tcpConnPerIp": 250,
+  "udpPpsPerIp": 8000,
+  "udpBurst": 12000
+}
+JSON
+  chmod 666 "$APP_DIR/backend/config.json"
+fi
+
+export PATH="/usr/local/go/bin:$PATH"
+go mod tidy
+go build -o portpanel main.go
+
+echo "==> [5] Tạo systemd service"
+cat > /etc/systemd/system/ifw.service <<EOF
+[Unit]
+Description=IFW PortPanel
+After=network.target
+
+[Service]
+WorkingDirectory=$APP_DIR/backend
+# Env chỉ để default lần đầu; sau đó chỉnh trong web (config.json)
+Environment=DDOS_DEFENSE=1
+Environment=DDOS_TCP_SYN_PER_IP=150
+Environment=DDOS_TCP_SYN_BURST=300
+Environment=DDOS_TCP_CONN_PER_IP=250
+Environment=DDOS_UDP_PPS_PER_IP=8000
+Environment=DDOS_UDP_BURST=12000
+ExecStart=$APP_DIR/backend/portpanel --port $PANEL_PORT
+Restart=on-failure
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now ifw.service
+
+IP=$(curl -s4 https://api.ipify.org || echo "YOUR_IP")
+echo "==> HOÀN TẤT! Panel: http://$IP:$PANEL_PORT/adminsetupfw/"
+echo "   • Tab Forwarding: tạo/sửa/tạm dừng/xóa rule"
+echo "   • Tab Blocked:    block/unblock IP ngay lập tức"
+echo "   • Tab Whitelist:  thêm/gỡ IP bypass hạn chế"
+echo "   • Tab Rate Config: bật/tắt chống DDoS + chỉnh ngưỡng, áp dụng tức thì"
+echo "==> Tip: dữ liệu lưu tại $APP_DIR/backend/{rules.json,config.json}"
+
+systemctl restart ifw
+echo "==> DONE!"
+BASH
