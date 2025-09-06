@@ -1,14 +1,21 @@
-bash -s <<'PATCH'
+#!/usr/bin/env bash
 set -euo pipefail
+
+PANEL_PORT="${1:-2020}"
 APP_DIR="/opt/ifw"
-PORT="${1:-2020}"
+GO_VERSION="1.22.4"
+export DEBIAN_FRONTEND=noninteractive
 
-echo "==> Backup files"
-mkdir -p /root/ifw_bak
-cp -a "$APP_DIR/backend/main.go" "/root/ifw_bak/main.go.$(date +%s)" 2>/dev/null || true
-cp -a "$APP_DIR/backend/public/index.html" "/root/ifw_bak/index.html.$(date +%s)" 2>/dev/null || true
+if [ "$(id -u)" -ne 0 ]; then
+  echo "Please run as root"; exit 1
+fi
 
-echo "==> Update backend (better conntrack parsing for DNAT)"
+echo "==> Tạo thư mục ứng dụng"
+mkdir -p "$APP_DIR/backend/public" /etc/ipset /etc/iptables
+
+# ======================
+# Backend (Go) — API quản trị iptables/ipset; Forwarding = DNAT trong kernel
+# ======================
 cat > "$APP_DIR/backend/main.go" <<'GO'
 package main
 
@@ -156,7 +163,6 @@ func listIPSet(name string) ([]string,error){
 }
 
 func getConntrackLines() []string {
-	// prefer proc (fast), fallback conntrack -L
 	if b,err := os.ReadFile("/proc/net/nf_conntrack"); err==nil && len(b)>0 {
 		return strings.Split(string(b), "\n")
 	}
@@ -165,14 +171,10 @@ func getConntrackLines() []string {
 	return strings.Split(string(out), "\n")
 }
 func lineHasProto(line string) string {
-	// try to detect tcp/udp anywhere in tokens
 	for _, t := range strings.Fields(line) {
 		if t=="tcp" || t=="udp" { return t }
 	}
-	// fallback best guess
-	if strings.Contains(line," dport=") {
-		if strings.Contains(line," udp ") { return "udp" }
-	}
+	if strings.Contains(line," udp ") { return "udp" }
 	return "tcp"
 }
 
@@ -305,11 +307,8 @@ func main(){
 
 		for _, line := range lines {
 			if line == "" { continue }
-			// find proto anywhere (works for /proc/net/nf_conntrack & conntrack -L)
 			proto := lineHasProto(line)
 			if proto!="tcp" && proto!="udp" { continue }
-
-			// grab first src=, dst=, dport=
 			var src,dst,dport string
 			for _, t := range strings.Fields(line) {
 				if strings.HasPrefix(t,"src=") && src=="" { src = strings.TrimPrefix(t,"src=") }
@@ -317,7 +316,6 @@ func main(){
 				if strings.HasPrefix(t,"dport=") && dport=="" { dport = strings.TrimPrefix(t,"dport=") }
 			}
 			if src=="" || dst=="" || dport=="" { continue }
-
 			for _, ru := range active {
 				for _, p := range protoMap(ru.Proto) {
 					if p != proto { continue }
@@ -403,7 +401,14 @@ func main(){
 }
 GO
 
-echo "==> Update frontend (auto refresh list mỗi 2s)"
+cat > "$APP_DIR/backend/go.mod" <<'GOMOD'
+module ifw
+go 1.22
+GOMOD
+
+# ======================
+# Frontend — Vue CDN (không cần Node), auto refresh 2s
+# ======================
 cat > "$APP_DIR/backend/public/index.html" <<'HTML'
 <!DOCTYPE html>
 <html lang="vi">
@@ -668,7 +673,7 @@ cat > "$APP_DIR/backend/public/index.html" <<'HTML'
 
         onMounted(()=>{
           fetchRules(); loadCfg();
-          setInterval(()=>{ if(tab.value==='lists'){ loadLists() } }, 2000)  // auto refresh 2s
+          setInterval(()=>{ if(tab.value==='lists'){ loadLists() } }, 2000)
         })
         return {tab,go,fmt,toast,form,rules,createRule,toggleRule,del,edit,editing,saveEdit,conns,suspects,blocked,white,blkIp,wIp,blockIP,unblockIP,whiteIP,unwhiteIP,cfg,saveCfg,loadLists,blockAll}
       }
@@ -678,14 +683,117 @@ cat > "$APP_DIR/backend/public/index.html" <<'HTML'
 </html>
 HTML
 
-echo "==> Rebuild & restart service"
-export PATH="/usr/local/go/bin:$PATH"
+# ======================
+# Cài gói & tối ưu hệ thống
+# ======================
+echo "==> Cài đặt gói cần thiết"
+apt-get update -y
+apt-get install -y curl ca-certificates build-essential iptables iptables-persistent netfilter-persistent ipset conntrack jq
+
+# Cài Go nếu thiếu
+if ! command -v go >/dev/null 2>&1; then
+  echo "==> Cài Go ${GO_VERSION}"
+  curl -sL https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz | tar -xz -C /usr/local
+  export PATH="/usr/local/go/bin:$PATH"
+  grep -q '/usr/local/go/bin' /root/.profile || echo 'export PATH="/usr/local/go/bin:$PATH"' >> /root/.profile
+fi
+
+echo "==> Áp sysctl tối ưu"
+cat > /etc/sysctl.d/99-ifw-dnat.conf <<SYSCTL
+net.core.somaxconn=8192
+net.core.netdev_max_backlog=250000
+net.core.rmem_max=67108864
+net.core.wmem_max=67108864
+net.ipv4.ip_forward=1
+net.ipv4.tcp_congestion_control=bbr
+net.ipv4.tcp_fastopen=3
+net.ipv4.tcp_max_syn_backlog=16384
+net.ipv4.tcp_syncookies=1
+net.ipv4.tcp_synack_retries=2
+net.netfilter.nf_conntrack_max=1048576
+net.netfilter.nf_conntrack_udp_timeout=30
+net.netfilter.nf_conntrack_udp_timeout_stream=120
+net.netfilter.nf_conntrack_tcp_timeout_established=600
+SYSCTL
+sysctl --system >/dev/null || true
+
+echo "==> Chuẩn bị iptables/ipset cơ bản"
+modprobe ip_set 2>/dev/null || true
+modprobe ip_set_hash_ip 2>/dev/null || true
+modprobe nf_conntrack 2>/dev/null || true
+modprobe iptable_nat 2>/dev/null || true
+modprobe nf_synproxy_core 2>/dev/null || true
+
+ipset create gofw_block hash:ip family inet maxelem 200000 -exist
+ipset create gofw_white hash:ip family inet maxelem 100000 -exist
+
+iptables -t raw -C PREROUTING -m set --match-set gofw_block src -j DROP 2>/dev/null || \
+iptables -t raw -I PREROUTING -m set --match-set gofw_block src -j DROP
+
+iptables -C FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+iptables -I INPUT -p tcp --dport "$PANEL_PORT" -j ACCEPT || true
+
+iptables-save > /etc/iptables/rules.v4 || true
+ipset save > /etc/ipset/rules.v4 || true
+netfilter-persistent save || true
+
+# ======================
+# Build backend
+# ======================
+echo "==> Build backend"
 cd "$APP_DIR/backend"
+[ -f rules.json ] || { echo "[]" > rules.json; chmod 666 rules.json; }
+[ -f config.json ] || cat > config.json <<JSON
+{
+  "ddosDefense": true,
+  "tcpSynPerIp": 150,
+  "tcpSynBurst": 300,
+  "tcpConnPerIp": 250,
+  "udpPpsPerIp": 8000,
+  "udpBurst": 12000
+}
+JSON
+chmod 666 config.json
+
+export PATH="/usr/local/go/bin:$PATH"
 go mod tidy
 go build -o portpanel main.go
-systemctl restart ifw
 
-IP=$(hostname -I | awk '{print $1}')
-echo "Done. Mở: http://$IP:${PORT}/adminsetupfw/"
-echo "• /api/connections giờ đọc nf_conntrack (DNAT) + UI tự refresh 2s ở tab 'Danh sách IP'."
-PATCH
+# ======================
+# systemd service
+# ======================
+echo "==> Tạo systemd service"
+cat > /etc/systemd/system/ifw.service <<EOF
+[Unit]
+Description=IFW DNAT Panel (kernel DNAT + SYNPROXY + limits)
+After=network.target
+
+[Service]
+WorkingDirectory=$APP_DIR/backend
+Environment=DDOS_DEFENSE=1
+Environment=DDOS_TCP_SYN_PER_IP=150
+Environment=DDOS_TCP_SYN_BURST=300
+Environment=DDOS_TCP_CONN_PER_IP=250
+Environment=DDOS_UDP_PPS_PER_IP=8000
+Environment=DDOS_UDP_BURST=12000
+ExecStart=$APP_DIR/backend/portpanel --port $PANEL_PORT
+Restart=on-failure
+User=root
+#LimitNOFILE=200000
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now ifw.service || true
+systemctl restart ifw.service || true
+
+IP=$(curl -s4 https://api.ipify.org || hostname -I | awk '{print $1}')
+echo
+echo "==> HOÀN TẤT!"
+echo "Panel:  http://$IP:$PANEL_PORT/adminsetupfw/"
+echo "API:    /api/rules, /api/blocked, /api/whitelisted, /api/connections"
+echo "Logs:   journalctl -u ifw -n 200 --no-pager"
