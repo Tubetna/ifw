@@ -1,22 +1,14 @@
-#!/usr/bin/env bash
+bash -s <<'PATCH'
 set -euo pipefail
-
-PANEL_PORT="${1:-2020}"
 APP_DIR="/opt/ifw"
-GO_VERSION="1.22.4"
-export DEBIAN_FRONTEND=noninteractive
+PORT="${1:-2020}"
 
-if [ "$(id -u)" -ne 0 ]; then
-  echo "Please run as root"
-  exit 1
-fi
+echo "==> Backup files"
+mkdir -p /root/ifw_bak
+cp -a "$APP_DIR/backend/main.go" "/root/ifw_bak/main.go.$(date +%s)" 2>/dev/null || true
+cp -a "$APP_DIR/backend/public/index.html" "/root/ifw_bak/index.html.$(date +%s)" 2>/dev/null || true
 
-echo "==> Tạo thư mục app"
-mkdir -p "$APP_DIR/backend/public" /etc/ipset /etc/iptables
-
-# ======================
-# Backend (Go) — API quản trị iptables/ipset; Forwarding = DNAT trong kernel
-# ======================
+echo "==> Update backend (better conntrack parsing for DNAT)"
 cat > "$APP_DIR/backend/main.go" <<'GO'
 package main
 
@@ -38,14 +30,13 @@ import (
 
 type Rule struct {
 	ID        string    `json:"id"`
-	Proto     string    `json:"proto"`   // tcp | udp | both
-	FromPort  string    `json:"fromPort"`// cổng VPS nghe để DNAT
-	ToIP      string    `json:"toIp"`    // IP đích
-	ToPort    string    `json:"toPort"`  // cổng đích
+	Proto     string    `json:"proto"`
+	FromPort  string    `json:"fromPort"`
+	ToIP      string    `json:"toIp"`
+	ToPort    string    `json:"toPort"`
 	TimeAdded time.Time `json:"timeAdded"`
 	Active    bool      `json:"active"`
 }
-
 type Config struct {
 	DDOSDefense  bool `json:"ddosDefense"`
 	TcpSynPerIp  int  `json:"tcpSynPerIp"`
@@ -63,189 +54,135 @@ var (
 	mu         sync.Mutex
 )
 
-func defaultConfig() Config {
-	return Config{DDOSDefense: true, TcpSynPerIp: 150, TcpSynBurst: 300, TcpConnPerIp: 250, UdpPpsPerIp: 8000, UdpBurst: 12000}
-}
+func defaultConfig() Config { return Config{DDOSDefense:true, TcpSynPerIp:150, TcpSynBurst:300, TcpConnPerIp:250, UdpPpsPerIp:8000, UdpBurst:12000} }
+func getenvInt(k string, def int) int { if v:=os.Getenv(k); v!="" { var x int; if _,e:=fmt.Sscanf(v,"%d",&x); e==nil && x>0 { return x } } ; return def }
+func run(cmd string) error { log.Println("[CMD]",cmd); a:=strings.Fields(cmd); out,err:=exec.Command(a[0],a[1:]...).CombinedOutput(); if err!=nil { log.Printf("[ERR] %s => %s",cmd,out) } ; return err }
+func protoMap(p string) []string { switch strings.ToLower(p){ case "both","all": return []string{"tcp","udp"} ; default: return []string{strings.ToLower(p)} } }
 
-func getenvInt(k string, def int) int {
-	if v := os.Getenv(k); v != "" {
-		var x int
-		if _, err := fmt.Sscanf(v, "%d", &x); err == nil && x > 0 { return x }
-	}
-	return def
-}
-
-func run(cmd string) error {
-	log.Println("[CMD]", cmd)
-	args := strings.Fields(cmd)
-	out, err := exec.Command(args[0], args[1:]...).CombinedOutput()
-	if err != nil {
-		log.Printf("[ERR] %s => %s", cmd, string(out))
-	}
-	return err
-}
-
-func protoMap(p string) []string {
-	switch strings.ToLower(p) {
-	case "both", "all":
-		return []string{"tcp", "udp"}
-	default:
-		return []string{strings.ToLower(p)}
-	}
-}
-
-// ========== RULE APPLY/REMOVE ==========
 func removeRuleSingle(r Rule, proto string) {
-	// xóa mọi rule có tag gofw-<id> / gofwdef-<id> / gofwwhite-<id> trong các table
-	for _, table := range []string{"raw", "mangle", "nat", "filter"} {
+	for _, table := range []string{"raw","mangle","nat","filter"} {
 		out, _ := exec.Command("iptables-save", "-t", table).Output()
 		for _, l := range strings.Split(string(out), "\n") {
-			if (strings.Contains(l, "gofw-"+r.ID) || strings.Contains(l, "gofwdef-"+r.ID) || strings.Contains(l, "gofwwhite-"+r.ID)) &&
-				(strings.Contains(l, proto) || proto == "both") {
-				line := l
-				if strings.HasPrefix(line, "-A") { line = strings.Replace(line, "-A", "-D", 1) }
+			if (strings.Contains(l,"gofw-"+r.ID)||strings.Contains(l,"gofwdef-"+r.ID)||strings.Contains(l,"gofwwhite-"+r.ID)) &&
+				(strings.Contains(l, proto) || proto=="both") {
+				line := l; if strings.HasPrefix(line,"-A") { line = strings.Replace(line,"-A","-D",1) }
 				run(fmt.Sprintf("iptables -t %s %s", table, line))
 			}
 		}
 	}
 }
-
 func applyWhitelistBypass(r Rule) {
 	id := r.ID
 	for _, p := range protoMap(r.Proto) {
-		// đặt trên đầu FORWARD để tránh chặn nhầm user whitelist
-		run(fmt.Sprintf(`iptables -I FORWARD -p %s -m set --match-set gofw_white src -d %s --dport %s -m comment --comment gofwwhite-%s -j ACCEPT`, p, r.ToIP, r.ToPort, id))
+		run(fmt.Sprintf(`iptables -I FORWARD -p %s -m set --match-set gofw_white src -d %s --dport %s -m comment --comment gofwwhite-%s -j ACCEPT`, p,r.ToIP,r.ToPort,id))
 	}
 }
-
 func applyDefense(r Rule) {
 	if !cfg.DDOSDefense { return }
 	id := r.ID
-
-	// (1) SYNPROXY cho TCP rule cụ thể + không track SYN cho rule đó (per-rule, tránh global ảnh hưởng dịch vụ khác)
 	for _, p := range protoMap(r.Proto) {
-		if p == "tcp" {
-			// raw: CT --notrack cho SYN tới đúng ToIP:ToPort
+		if p=="tcp" {
 			run(fmt.Sprintf(`iptables -t raw -I PREROUTING -p tcp -d %s --dport %s --syn -m comment --comment gofwdef-%s -j CT --notrack`, r.ToIP, r.ToPort, id))
-			// mangle: SYNPROXY
 			run(fmt.Sprintf(`iptables -t mangle -I PREROUTING -p tcp -d %s --dport %s --syn -m comment --comment gofwdef-%s -j SYNPROXY --sack-perm --timestamp --wscale 7 --mss 1460`, r.ToIP, r.ToPort, id))
-			// filter: drop INVALID
 			run(fmt.Sprintf(`iptables -I FORWARD -m conntrack --ctstate INVALID -d %s --dport %s -m comment --comment gofwdef-%s -j DROP`, r.ToIP, r.ToPort, id))
-
-			// (2) Giới hạn SYN/giây mỗi IP
 			run(fmt.Sprintf(`iptables -I FORWARD -p tcp -d %s --dport %s --syn -m hashlimit --hashlimit-above %d/second --hashlimit-burst %d --hashlimit-mode srcip --hashlimit-name syn-%s -m comment --comment gofwdef-%s -j DROP`,
 				r.ToIP, r.ToPort, cfg.TcpSynPerIp, cfg.TcpSynBurst, id, id))
-			// (3) Giới hạn concurrent per IP
 			run(fmt.Sprintf(`iptables -I FORWARD -p tcp -d %s --dport %s -m connlimit --connlimit-above %d --connlimit-mask 32 -m comment --comment gofwdef-%s -j DROP`,
 				r.ToIP, r.ToPort, cfg.TcpConnPerIp, id))
 		}
-		if p == "udp" {
-			// (4) UDP pps NEW per IP
+		if p=="udp" {
 			run(fmt.Sprintf(`iptables -I FORWARD -p udp -d %s --dport %s -m conntrack --ctstate NEW -m hashlimit --hashlimit-above %d/second --hashlimit-burst %d --hashlimit-mode srcip --hashlimit-name udpf-%s -m comment --comment gofwdef-%s -j DROP`,
 				r.ToIP, r.ToPort, cfg.UdpPpsPerIp, cfg.UdpBurst, id, id))
 		}
 	}
-
-	// (5) Bảo đảm ESTABLISHED/RELATED
 	run("iptables -C FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT")
 }
-
-func removeDefense(r Rule) { removeRuleSingle(r, "both") }
-
 func applyDNAT(r Rule) {
 	id := r.ID
 	for _, p := range protoMap(r.Proto) {
-		// DNAT + MASQUERADE + ACCEPT chiều đi/về
 		run(fmt.Sprintf("iptables -t nat -I PREROUTING -p %s --dport %s -m comment --comment gofw-%s -j DNAT --to-destination %s:%s", p, r.FromPort, id, r.ToIP, r.ToPort))
 		run(fmt.Sprintf("iptables -t nat -I POSTROUTING -p %s -d %s --dport %s -m comment --comment gofw-%s -j MASQUERADE", p, r.ToIP, r.ToPort, id))
 		run(fmt.Sprintf("iptables -I FORWARD -p %s -d %s --dport %s -m comment --comment gofw-%s -j ACCEPT", p, r.ToIP, r.ToPort, id))
 		run(fmt.Sprintf("iptables -I FORWARD -p %s -s %s --sport %s -m comment --comment gofw-%s -j ACCEPT", p, r.ToIP, r.ToPort, id))
 	}
-	// whitelist bypass ở trên defense (đã insert trước)
 }
-
-func removeDNAT(r Rule) { removeRuleSingle(r, "both") }
-
-func applyRule(r Rule) {
-	applyWhitelistBypass(r) // insert trước để đứng trên các DROP
-	applyDefense(r)
-	applyDNAT(r)
-}
-
-func removeRule(r Rule) {
-	removeDefense(r)
-	removeDNAT(r)
-	// remove whitelist bypass
-	out, _ := exec.Command("iptables-save", "-t", "filter").Output()
+func applyRule(r Rule){ applyWhitelistBypass(r); applyDefense(r); applyDNAT(r) }
+func removeDefense(r Rule){ removeRuleSingle(r,"both") }
+func removeDNAT(r Rule){ removeRuleSingle(r,"both") }
+func removeRule(r Rule){ removeDefense(r); removeDNAT(r);
+	out,_ := exec.Command("iptables-save","-t","filter").Output()
 	for _, l := range strings.Split(string(out), "\n") {
-		if strings.Contains(l, "gofwwhite-"+r.ID) {
-			line := l
-			if strings.HasPrefix(line, "-A") { line = strings.Replace(line, "-A", "-D", 1) }
+		if strings.Contains(l,"gofwwhite-"+r.ID) {
+			line := l; if strings.HasPrefix(line,"-A"){ line=strings.Replace(line,"-A","-D",1) }
 			run(fmt.Sprintf("iptables -t filter %s", line))
 		}
 	}
 }
 
-func saveRules() {
-	f, _ := os.Create(rulesFile); defer f.Close()
-	enc := json.NewEncoder(f); enc.SetIndent("", "  "); _ = enc.Encode(rules)
-}
-func loadRules() {
-	f, err := os.Open(rulesFile); if err != nil { return }
-	defer f.Close(); _ = json.NewDecoder(f).Decode(&rules)
-}
-func saveConfig() error {
-	f, err := os.Create(configFile); if err != nil { return err }
-	defer f.Close(); enc := json.NewEncoder(f); enc.SetIndent("", "  "); return enc.Encode(cfg)
-}
-func loadConfig() {
-	cfg = defaultConfig()
-	cfg.TcpSynPerIp  = getenvInt("DDOS_TCP_SYN_PER_IP",  cfg.TcpSynPerIp)
-	cfg.TcpSynBurst  = getenvInt("DDOS_TCP_SYN_BURST",  cfg.TcpSynBurst)
-	cfg.TcpConnPerIp = getenvInt("DDOS_TCP_CONN_PER_IP",cfg.TcpConnPerIp)
-	cfg.UdpPpsPerIp  = getenvInt("DDOS_UDP_PPS_PER_IP", cfg.UdpPpsPerIp)
-	cfg.UdpBurst     = getenvInt("DDOS_UDP_BURST",     cfg.UdpBurst)
-	if os.Getenv("DDOS_DEFENSE") == "0" { cfg.DDOSDefense = false }
-
-	f, err := os.Open(configFile)
-	if err == nil {
+func saveRules(){ f,_:=os.Create(rulesFile); defer f.Close(); enc:=json.NewEncoder(f); enc.SetIndent("","  "); _=enc.Encode(rules) }
+func loadRules(){ f,err:=os.Open(rulesFile); if err!=nil { return }; defer f.Close(); _=json.NewDecoder(f).Decode(&rules) }
+func saveConfig() error { f,err:=os.Create(configFile); if err!=nil { return err }; defer f.Close(); enc:=json.NewEncoder(f); enc.SetIndent("","  "); return enc.Encode(cfg) }
+func loadConfig(){
+	cfg=defaultConfig()
+	cfg.TcpSynPerIp=getenvInt("DDOS_TCP_SYN_PER_IP",cfg.TcpSynPerIp)
+	cfg.TcpSynBurst=getenvInt("DDOS_TCP_SYN_BURST",cfg.TcpSynBurst)
+	cfg.TcpConnPerIp=getenvInt("DDOS_TCP_CONN_PER_IP",cfg.TcpConnPerIp)
+	cfg.UdpPpsPerIp=getenvInt("DDOS_UDP_PPS_PER_IP",cfg.UdpPpsPerIp)
+	cfg.UdpBurst=getenvInt("DDOS_UDP_BURST",cfg.UdpBurst)
+	if os.Getenv("DDOS_DEFENSE")=="0" { cfg.DDOSDefense=false }
+	if f,err:=os.Open(configFile); err==nil {
 		defer f.Close()
 		var c Config
-		if json.NewDecoder(f).Decode(&c) == nil {
-			if c.TcpSynPerIp  > 0 { cfg.TcpSynPerIp  = c.TcpSynPerIp }
-			if c.TcpSynBurst  > 0 { cfg.TcpSynBurst  = c.TcpSynBurst }
-			if c.TcpConnPerIp > 0 { cfg.TcpConnPerIp = c.TcpConnPerIp }
-			if c.UdpPpsPerIp  > 0 { cfg.UdpPpsPerIp  = c.UdpPpsPerIp }
-			if c.UdpBurst     > 0 { cfg.UdpBurst     = c.UdpBurst }
-			cfg.DDOSDefense = c.DDOSDefense
+		if json.NewDecoder(f).Decode(&c)==nil {
+			if c.TcpSynPerIp>0 { cfg.TcpSynPerIp=c.TcpSynPerIp }
+			if c.TcpSynBurst>0 { cfg.TcpSynBurst=c.TcpSynBurst }
+			if c.TcpConnPerIp>0 { cfg.TcpConnPerIp=c.TcpConnPerIp }
+			if c.UdpPpsPerIp>0 { cfg.UdpPpsPerIp=c.UdpPpsPerIp }
+			if c.UdpBurst>0 { cfg.UdpBurst=c.UdpBurst }
+			cfg.DDOSDefense=c.DDOSDefense
 		}
 	}
 	_ = saveConfig()
 }
-
-func listIPSet(name string) ([]string, error) {
-	out, err := exec.Command("ipset", "list", name, "-o", "save").CombinedOutput()
-	if err != nil { return nil, fmt.Errorf("ipset list error: %v\n%s", err, string(out)) }
-	ips := []string{}
+func listIPSet(name string) ([]string,error){
+	out,err := exec.Command("ipset","list",name,"-o","save").CombinedOutput()
+	if err!=nil { return nil, fmt.Errorf("ipset list error: %v\n%s", err, out) }
+	ips:=[]string{}
 	for _, l := range strings.Split(string(out), "\n") {
 		f := strings.Fields(l)
-		if len(f) == 3 && f[0] == "add" && f[1] == name { ips = append(ips, f[2]) }
+		if len(f)==3 && f[0]=="add" && f[1]==name { ips = append(ips, f[2]) }
 	}
-	return ips, nil
+	return ips,nil
 }
 
-type ipReq struct{ IP string `json:"ip"` }
+func getConntrackLines() []string {
+	// prefer proc (fast), fallback conntrack -L
+	if b,err := os.ReadFile("/proc/net/nf_conntrack"); err==nil && len(b)>0 {
+		return strings.Split(string(b), "\n")
+	}
+	out,err := exec.Command("bash","-lc","conntrack -L 2>/dev/null").Output()
+	if err!=nil || len(out)==0 { return []string{} }
+	return strings.Split(string(out), "\n")
+}
+func lineHasProto(line string) string {
+	// try to detect tcp/udp anywhere in tokens
+	for _, t := range strings.Fields(line) {
+		if t=="tcp" || t=="udp" { return t }
+	}
+	// fallback best guess
+	if strings.Contains(line," dport=") {
+		if strings.Contains(line," udp ") { return "udp" }
+	}
+	return "tcp"
+}
 
-// ========== MAIN ==========
-func main() {
+func main(){
 	var port int
-	flag.IntVar(&port, "port", 2020, "Port for admin panel")
+	flag.IntVar(&port,"port",2020,"Port for admin panel")
 	flag.Parse()
+	abs,_ := filepath.Abs(rulesFile); rulesFile = abs
+	absC,_ := filepath.Abs(configFile); configFile = absC
 
-	abs, _ := filepath.Abs(rulesFile);  rulesFile  = abs
-	absC, _ := filepath.Abs(configFile);configFile = absC
-
-	// Module + sets + raw-drop blocklist
 	_ = run("modprobe ip_set 2>/dev/null || true")
 	_ = run("modprobe ip_set_hash_ip 2>/dev/null || true")
 	_ = run("modprobe nf_conntrack 2>/dev/null || true")
@@ -261,36 +198,35 @@ func main() {
 	for _, r := range rules { if r.Active { applyRule(r) } }
 
 	mux := http.NewServeMux()
-	// static
 	mux.Handle("/adminsetupfw/", http.StripPrefix("/adminsetupfw/", http.FileServer(http.Dir("public"))))
 
-	// Rules CRUD
-	mux.HandleFunc("/api/rules", func(w http.ResponseWriter, r *http.Request) {
+	// CRUD rules
+	mux.HandleFunc("/api/rules", func(w http.ResponseWriter, r *http.Request){
 		mu.Lock(); defer mu.Unlock()
 		switch r.Method {
 		case "GET":
-			w.Header().Set("Content-Type", "application/json"); _ = json.NewEncoder(w).Encode(rules)
+			w.Header().Set("Content-Type","application/json"); _=json.NewEncoder(w).Encode(rules)
 		case "POST":
-			var in Rule; b, _ := io.ReadAll(r.Body)
-			if json.Unmarshal(b, &in) != nil || in.FromPort=="" || in.ToIP=="" || in.ToPort=="" { http.Error(w, "invalid json", 400); return }
-			for _, x := range rules { if x.FromPort==in.FromPort && strings.EqualFold(x.Proto,in.Proto) && x.Active { http.Error(w, "Port này đã được forward!", 409); return } }
+			var in Rule; b,_ := io.ReadAll(r.Body)
+			if json.Unmarshal(b,&in)!=nil || in.FromPort=="" || in.ToIP=="" || in.ToPort=="" { http.Error(w,"invalid json",400); return }
+			for _, x := range rules { if x.FromPort==in.FromPort && strings.EqualFold(x.Proto,in.Proto) && x.Active { http.Error(w,"Port này đã được forward!",409); return } }
 			in.ID = fmt.Sprintf("%d", time.Now().UnixNano())
-			in.TimeAdded = time.Now(); in.Active = true
-			rules = append(rules, in); applyRule(in); saveRules()
+			in.TimeAdded = time.Now(); in.Active=true
+			rules = append(rules,in); applyRule(in); saveRules()
 			w.Header().Set("Content-Type","application/json"); _=json.NewEncoder(w).Encode(in)
 		default: http.Error(w,"Method not allowed",405)
 		}
 	})
-	mux.HandleFunc("/api/rules/", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/rules/", func(w http.ResponseWriter, r *http.Request){
 		mu.Lock(); defer mu.Unlock()
-		id := strings.TrimPrefix(r.URL.Path, "/api/rules/")
-		if strings.HasSuffix(id, "/toggle") { id = strings.TrimSuffix(id, "/toggle") }
+		id := strings.TrimPrefix(r.URL.Path,"/api/rules/")
+		if strings.HasSuffix(id,"/toggle"){ id = strings.TrimSuffix(id,"/toggle") }
 		idx := -1; for i,x := range rules { if x.ID==id { idx=i; break } }
 		if idx==-1 { http.Error(w,"not found",404); return }
 		switch {
 		case r.Method=="DELETE":
 			removeRule(rules[idx]); rules = append(rules[:idx], rules[idx+1:]...); saveRules(); w.WriteHeader(204)
-		case r.Method=="POST" && strings.HasSuffix(r.URL.Path, "/toggle"):
+		case r.Method=="POST" && strings.HasSuffix(r.URL.Path,"/toggle"):
 			rules[idx].Active = !rules[idx].Active
 			if rules[idx].Active { applyRule(rules[idx]) } else { removeRule(rules[idx]) }
 			saveRules(); w.Header().Set("Content-Type","application/json"); _=json.NewEncoder(w).Encode(rules[idx])
@@ -299,15 +235,15 @@ func main() {
 			if json.Unmarshal(b,&in)!=nil { http.Error(w,"invalid json",400); return }
 			for i,x := range rules { if i!=idx && x.FromPort==in.FromPort && strings.EqualFold(x.Proto,in.Proto) && x.Active { http.Error(w,"Port này đã được forward!",409); return } }
 			was := rules[idx].Active
-			if was { removeDefense(rules[idx]) } // giữ DNAT, sẽ áp lại ngay sau
-			rules[idx].Proto = in.Proto; rules[idx].FromPort=in.FromPort; rules[idx].ToIP=in.ToIP; rules[idx].ToPort=in.ToPort
-			if was { applyDefense(rules[idx]) } // whitelist bypass giữ nguyên
+			if was { removeDefense(rules[idx]) }
+			rules[idx].Proto=in.Proto; rules[idx].FromPort=in.FromPort; rules[idx].ToIP=in.ToIP; rules[idx].ToPort=in.ToPort
+			if was { applyDefense(rules[idx]) }
 			saveRules(); w.Header().Set("Content-Type","application/json"); _=json.NewEncoder(w).Encode(rules[idx])
 		default: http.Error(w,"Method not allowed",405)
 		}
 	})
 
-	// Block / Unblock / List
+	// block/unblock/list
 	type ipReq struct{ IP string `json:"ip"` }
 	mux.HandleFunc("/api/block", func(w http.ResponseWriter, r *http.Request){
 		if r.Method!="POST" { http.Error(w,"Method not allowed",405); return }
@@ -324,7 +260,7 @@ func main() {
 		w.WriteHeader(204)
 	})
 	mux.HandleFunc("/api/blocked", func(w http.ResponseWriter, r *http.Request){
-		ips, err := listIPSet("gofw_block"); if err!=nil { http.Error(w,err.Error(),500); return }
+		ips,err := listIPSet("gofw_block"); if err!=nil { http.Error(w,err.Error(),500); return }
 		w.Header().Set("Content-Type","application/json"); _=json.NewEncoder(w).Encode(map[string]any{"set":"gofw_block","count":len(ips),"ips":ips})
 	})
 	mux.HandleFunc("/api/whitelist", func(w http.ResponseWriter, r *http.Request){
@@ -342,12 +278,12 @@ func main() {
 		w.WriteHeader(204)
 	})
 	mux.HandleFunc("/api/whitelisted", func(w http.ResponseWriter, r *http.Request){
-		ips, err := listIPSet("gofw_white"); if err!=nil { http.Error(w,err.Error(),500); return }
+		ips,err := listIPSet("gofw_white"); if err!=nil { http.Error(w,err.Error(),500); return }
 		w.Header().Set("Content-Type","application/json"); _=json.NewEncoder(w).Encode(map[string]any{"set":"gofw_white","count":len(ips),"ips":ips})
 	})
 
-	// Connections (conntrack) — ai đang kết nối tới ToIP:ToPort
-	mux.HandleFunc("/api/connections", func(w http.ResponseWriter, r *http.Request) {
+	// connections: realtime (reads nf_conntrack or conntrack -L)
+	mux.HandleFunc("/api/connections", func(w http.ResponseWriter, r *http.Request){
 		type ConnInfo struct {
 			IP       string `json:"ip"`
 			Port     string `json:"port"`
@@ -364,26 +300,28 @@ func main() {
 		mu.Unlock()
 
 		res := []ConnInfo{}
-		out, err := exec.Command("bash","-lc","conntrack -L 2>/dev/null").Output()
-		if err != nil { w.Header().Set("Content-Type","application/json"); _=json.NewEncoder(w).Encode(res); return }
-
+		lines := getConntrackLines()
 		counts := map[string]map[string]int{} // ruleID -> ip -> count
-		lines := strings.Split(string(out), "\n")
+
 		for _, line := range lines {
-			if !(strings.HasPrefix(line,"tcp") || strings.HasPrefix(line,"udp")) { continue }
-			proto := "tcp"; if strings.HasPrefix(line,"udp") { proto="udp" }
-			toks := strings.Fields(line)
+			if line == "" { continue }
+			// find proto anywhere (works for /proc/net/nf_conntrack & conntrack -L)
+			proto := lineHasProto(line)
+			if proto!="tcp" && proto!="udp" { continue }
+
+			// grab first src=, dst=, dport=
 			var src,dst,dport string
-			for _, t := range toks {
-				if strings.HasPrefix(t,"src=") && src==""  { src = strings.TrimPrefix(t,"src=") }
-				if strings.HasPrefix(t,"dst=") && dst==""  { dst = strings.TrimPrefix(t,"dst=") }
+			for _, t := range strings.Fields(line) {
+				if strings.HasPrefix(t,"src=") && src=="" { src = strings.TrimPrefix(t,"src=") }
+				if strings.HasPrefix(t,"dst=") && dst=="" { dst = strings.TrimPrefix(t,"dst=") }
 				if strings.HasPrefix(t,"dport=") && dport=="" { dport = strings.TrimPrefix(t,"dport=") }
 			}
 			if src=="" || dst=="" || dport=="" { continue }
+
 			for _, ru := range active {
 				for _, p := range protoMap(ru.Proto) {
-					if p!=proto { continue }
-					if ru.ToIP==dst && ru.ToPort==dport {
+					if p != proto { continue }
+					if ru.ToIP == dst && ru.ToPort == dport {
 						if counts[ru.ID]==nil { counts[ru.ID]=map[string]int{} }
 						counts[ru.ID][src]++
 					}
@@ -393,53 +331,51 @@ func main() {
 		for _, ru := range active {
 			m := counts[ru.ID]
 			for ip,c := range m {
-				res = append(res, ConnInfo{IP:ip, Port:ru.ToPort, Proto:strings.ToLower(ru.Proto), RuleID:ru.ID, FromPort:ru.FromPort, ToIP:ru.ToIP, ToPort:ru.ToPort, Count:c})
+				res = append(res, ConnInfo{IP:ip,Port:ru.ToPort,Proto:strings.ToLower(ru.Proto),RuleID:ru.ID,FromPort:ru.FromPort,ToIP:ru.ToIP,ToPort:ru.ToPort,Count:c})
 			}
 		}
 		w.Header().Set("Content-Type","application/json"); _=json.NewEncoder(w).Encode(res)
 	})
 
-	// Suspected snapshot (ss)
-	mux.HandleFunc("/api/suspected", func(w http.ResponseWriter, r *http.Request) {
+	// suspected snapshot (ss)
+	mux.HandleFunc("/api/suspected", func(w http.ResponseWriter, r *http.Request){
 		type SI struct{ IP string `json:"ip"`; Count int `json:"count"` }
 		counter := map[string]int{}
-		out, _ := exec.Command("ss","-ntu").Output()
+		out,_ := exec.Command("ss","-ntu").Output()
 		for _, line := range strings.Split(string(out), "\n") {
 			f := strings.Fields(line); if len(f)<5 { continue }
-			remote := strings.Trim(f[4], "[]"); ip := strings.Split(remote,":")[0]
+			remote := strings.Trim(f[4],"[]"); ip := strings.Split(remote,":")[0]
 			if ip=="" || ip=="0.0.0.0" || ip=="*" { continue }
 			counter[ip]++
 		}
 		type kv struct{ IP string; Count int }
 		arr := []kv{}
-		for ip,c := range counter { if c>=50 { arr = append(arr, kv{ip,c}) } }
-		sort.Slice(arr, func(i,j int)bool { return arr[i].Count>arr[j].Count })
+		for ip,c := range counter { if c>=50 { arr=append(arr,kv{ip,c}) } }
+		sort.Slice(arr, func(i,j int)bool{ return arr[i].Count>arr[j].Count })
 		outArr := []SI{}; for _,x := range arr { outArr = append(outArr, SI{x.IP,x.Count}) }
 		w.Header().Set("Content-Type","application/json"); _=json.NewEncoder(w).Encode(outArr)
 	})
 
-	// Block all except whitelist
-	mux.HandleFunc("/api/blockall", func(w http.ResponseWriter, r *http.Request) {
+	// blockall
+	mux.HandleFunc("/api/blockall", func(w http.ResponseWriter, r *http.Request){
 		if r.Method!="POST" { http.Error(w,"Method not allowed",405); return }
-		whites, _ := listIPSet("gofw_white"); _ = whites
+		whites,_ := listIPSet("gofw_white")
 		_ = run("ipset flush gofw_block")
-		out, _ := exec.Command("ss","-ntu").Output()
+		out,_ := exec.Command("ss","-ntu").Output()
 		seen := map[string]bool{}
 		for _, line := range strings.Split(string(out), "\n") {
 			f := strings.Fields(line); if len(f)<5 { continue }
 			ip := strings.Split(strings.Trim(f[4],"[]"),":")[0]
 			if ip=="" || seen[ip] { continue }
-			seen[ip] = true
-			// Skip nếu nằm trong whitelist
-			skip := false
-			for _, wip := range whites { if ip==wip { skip=true; break } }
+			seen[ip]=true
+			skip := false; for _, wip := range whites { if ip==wip { skip=true; break } }
 			if !skip { _ = run(fmt.Sprintf("ipset add gofw_block %s -exist", ip)) }
 		}
 		w.WriteHeader(204)
 	})
 
-	// Config
-	mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
+	// config
+	mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request){
 		mu.Lock(); defer mu.Unlock()
 		switch r.Method {
 		case "GET":
@@ -455,7 +391,6 @@ func main() {
 			prev := cfg.DDOSDefense; cfg = in
 			if err := saveConfig(); err!=nil { http.Error(w,"save failed",500); return }
 			if prev || cfg.DDOSDefense {
-				// refresh defense cho rule đang active
 				for _, r := range rules { if r.Active { removeDefense(r); applyDefense(r) } }
 			}
 			w.Header().Set("Content-Type","application/json"); _=json.NewEncoder(w).Encode(cfg)
@@ -468,14 +403,7 @@ func main() {
 }
 GO
 
-cat > "$APP_DIR/backend/go.mod" <<'GOMOD'
-module ifw
-go 1.22
-GOMOD
-
-# ======================
-# Frontend — Vue CDN (không cần Node), UI đẹp, gọn
-# ======================
+echo "==> Update frontend (auto refresh list mỗi 2s)"
 cat > "$APP_DIR/backend/public/index.html" <<'HTML'
 <!DOCTYPE html>
 <html lang="vi">
@@ -517,7 +445,6 @@ cat > "$APP_DIR/backend/public/index.html" <<'HTML'
 
     <div v-if="toast" class="alert" :class="toast.cls">{{ toast.msg }}</div>
 
-    <!-- RULES -->
     <div v-show="tab==='rules'" class="glass p-4 mb-4">
       <form @submit.prevent="createRule" class="row g-3 align-items-end">
         <div class="col-md-2">
@@ -573,7 +500,6 @@ cat > "$APP_DIR/backend/public/index.html" <<'HTML'
       </div>
     </div>
 
-    <!-- LISTS -->
     <div v-show="tab==='lists'" class="glass p-4">
       <div class="d-flex justify-content-between align-items-center mb-3">
         <h5 class="mb-0">Danh sách IP realtime</h5>
@@ -647,7 +573,6 @@ cat > "$APP_DIR/backend/public/index.html" <<'HTML'
       </div>
     </div>
 
-    <!-- RATE CONFIG -->
     <div v-show="tab==='rate'" class="glass p-4">
       <div class="d-flex justify-content-between align-items-center mb-3">
         <h5 class="mb-0">Cấu hình chống DDoS</h5>
@@ -666,7 +591,6 @@ cat > "$APP_DIR/backend/public/index.html" <<'HTML'
       <div class="small muted mt-2">Whitelist được bỏ qua mọi hạn chế.</div>
     </div>
 
-    <!-- EDIT MODAL -->
     <div v-if="editing" class="position-fixed top-0 start-0 w-100 h-100" style="background:#0006">
       <div class="d-flex align-items-center justify-content-center h-100">
         <div class="glass p-3" style="min-width:360px">
@@ -701,9 +625,8 @@ cat > "$APP_DIR/backend/public/index.html" <<'HTML'
         const blkIp = ref(""), wIp = ref("")
         const cfg = ref({ ddosDefense:true, tcpSynPerIp:150, tcpSynBurst:300, tcpConnPerIp:250, udpPpsPerIp:8000, udpBurst:12000 })
         const fmt = t => t? new Date(t).toLocaleString('vi'):''
-
+        const flash = (m,cls='alert-success') => { toast.value={msg:m,cls}; setTimeout(()=>toast.value=null,2000) }
         const go = t => { tab.value=t; if(t==='rules') fetchRules(); if(t==='lists') loadLists(); if(t==='blocked'){loadBlock()} if(t==='whitelist'){loadWhite()} if(t==='rate'){loadCfg()} }
-        const flash = (m,cls='alert-success') => { toast.value = {msg:m,cls}; setTimeout(()=>toast.value=null,2200) }
 
         const fetchRules = async()=>{ rules.value = await (await fetch('/api/rules')).json() }
         const createRule = async()=>{
@@ -712,8 +635,7 @@ cat > "$APP_DIR/backend/public/index.html" <<'HTML'
           const r = await fetch('/api/rules',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
           if(r.status===409){ flash("Port này đã được forward!","alert-danger"); return }
           if(!r.ok){ flash("Tạo rule thất bại","alert-danger"); return }
-          form.value={ proto:'tcp', fromPort:'', toIp:'', toPort:'' }; flash("Đã tạo rule!")
-          fetchRules()
+          form.value={ proto:'tcp', fromPort:'', toIp:'', toPort:'' }; flash("Đã tạo rule!"); fetchRules()
         }
         const toggleRule = async (r)=>{ const x=await fetch(`/api/rules/${r.id}/toggle`,{method:'POST'}); flash(x.ok?"Đã cập nhật":"Lỗi","alert-"+(x.ok?"success":"danger")); fetchRules() }
         const del = async (r)=>{ if(confirm("Xóa rule?")){ const x=await fetch(`/api/rules/${r.id}`,{method:'DELETE'}); flash(x.ok?"Đã xóa":"Lỗi","alert-"+(x.ok?"success":"danger")); fetchRules() } }
@@ -744,7 +666,10 @@ cat > "$APP_DIR/backend/public/index.html" <<'HTML'
 
         const blockAll = async()=>{ if(!confirm('Block toàn bộ IP hiện tại (trừ whitelist)?')) return; const r = await fetch('/api/blockall',{method:'POST'}); flash(r.ok?'Đã block all':'Lỗi','alert-'+(r.ok?'success':'danger')); loadLists() }
 
-        onMounted(()=>{ fetchRules(); loadCfg() })
+        onMounted(()=>{
+          fetchRules(); loadCfg();
+          setInterval(()=>{ if(tab.value==='lists'){ loadLists() } }, 2000)  // auto refresh 2s
+        })
         return {tab,go,fmt,toast,form,rules,createRule,toggleRule,del,edit,editing,saveEdit,conns,suspects,blocked,white,blkIp,wIp,blockIP,unblockIP,whiteIP,unwhiteIP,cfg,saveCfg,loadLists,blockAll}
       }
     }).mount('#app')
@@ -753,125 +678,14 @@ cat > "$APP_DIR/backend/public/index.html" <<'HTML'
 </html>
 HTML
 
-# ======================
-# Cài gói & tối ưu hệ thống
-# ======================
-echo "==> Cài đặt gói cần thiết"
-apt-get update -y
-apt-get install -y curl ca-certificates build-essential iptables iptables-persistent netfilter-persistent ipset conntrack jq
-
-# Cài Go (chỉ để build backend API; forwarding là DNAT trong kernel)
-if ! command -v go >/dev/null 2>&1; then
-  echo "==> Cài Go ${GO_VERSION}"
-  curl -sL https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz | tar -xz -C /usr/local
-  export PATH="/usr/local/go/bin:$PATH"
-  grep -q '/usr/local/go/bin' /root/.profile || echo 'export PATH="/usr/local/go/bin:$PATH"' >> /root/.profile
-fi
-
-echo "==> Áp sysctl tối ưu"
-cat > /etc/sysctl.d/99-ifw-dnat.conf <<SYSCTL
-net.core.somaxconn=8192
-net.core.netdev_max_backlog=250000
-net.core.rmem_max=67108864
-net.core.wmem_max=67108864
-net.ipv4.ip_forward=1
-net.ipv4.tcp_congestion_control=bbr
-net.ipv4.tcp_fastopen=3
-net.ipv4.tcp_max_syn_backlog=16384
-net.ipv4.tcp_syncookies=1
-net.ipv4.tcp_synack_retries=2
-net.netfilter.nf_conntrack_max=1048576
-net.netfilter.nf_conntrack_udp_timeout=30
-net.netfilter.nf_conntrack_udp_timeout_stream=120
-net.netfilter.nf_conntrack_tcp_timeout_established=600
-SYSCTL
-sysctl --system >/dev/null || true
-
-echo "==> Chuẩn bị iptables/ipset cơ bản"
-modprobe ip_set 2>/dev/null || true
-modprobe ip_set_hash_ip 2>/dev/null || true
-modprobe nf_conntrack 2>/dev/null || true
-modprobe iptable_nat 2>/dev/null || true
-modprobe nf_synproxy_core 2>/dev/null || true
-
-ipset create gofw_block hash:ip family inet maxelem 200000 -exist
-ipset create gofw_white hash:ip family inet maxelem 100000 -exist
-
-# Rơi blocklist càng sớm càng tốt
-iptables -t raw -C PREROUTING -m set --match-set gofw_block src -j DROP 2>/dev/null || \
-iptables -t raw -I PREROUTING -m set --match-set gofw_block src -j DROP
-
-# Cho phép ESTABLISHED
-iptables -C FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
-iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-
-# Mở port panel
-iptables -I INPUT -p tcp --dport "$PANEL_PORT" -j ACCEPT || true
-
-# Lưu persistent
-iptables-save > /etc/iptables/rules.v4 || true
-ipset save > /etc/ipset/rules.v4 || true
-netfilter-persistent save || true
-
-# ======================
-# Build backend
-# ======================
-echo "==> Build backend"
-cd "$APP_DIR/backend"
-[ -f rules.json ] || { echo "[]" > rules.json; chmod 666 rules.json; }
-[ -f config.json ] || cat > config.json <<JSON
-{
-  "ddosDefense": true,
-  "tcpSynPerIp": 150,
-  "tcpSynBurst": 300,
-  "tcpConnPerIp": 250,
-  "udpPpsPerIp": 8000,
-  "udpBurst": 12000
-}
-JSON
-chmod 666 config.json
-
+echo "==> Rebuild & restart service"
 export PATH="/usr/local/go/bin:$PATH"
+cd "$APP_DIR/backend"
 go mod tidy
 go build -o portpanel main.go
+systemctl restart ifw
 
-# ======================
-# systemd service
-# ======================
-echo "==> Tạo systemd service"
-cat > /etc/systemd/system/ifw.service <<EOF
-[Unit]
-Description=IFW DNAT Panel (kernel DNAT + SYNPROXY + limits)
-After=network.target
-
-[Service]
-WorkingDirectory=$APP_DIR/backend
-Environment=DDOS_DEFENSE=1
-Environment=DDOS_TCP_SYN_PER_IP=150
-Environment=DDOS_TCP_SYN_BURST=300
-Environment=DDOS_TCP_CONN_PER_IP=250
-Environment=DDOS_UDP_PPS_PER_IP=8000
-Environment=DDOS_UDP_BURST=12000
-ExecStart=$APP_DIR/backend/portpanel --port $PANEL_PORT
-Restart=on-failure
-User=root
-# Optional tuning:
-# LimitNOFILE=200000
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable --now ifw.service || true
-systemctl restart ifw.service || true
-
-IP=$(curl -s4 https://api.ipify.org || hostname -I | awk '{print $1}')
-echo
-echo "==> HOÀN TẤT!"
-echo "Panel:  http://$IP:$PANEL_PORT/adminsetupfw/"
-echo "Forward: DNAT trong kernel (không proxy userspace) + SYNPROXY + hashlimit/connlimit + raw-drop + whitelist bypass"
-echo "API:    /api/rules, /api/blocked, /api/whitelisted, /api/connections (conntrack)"
-echo
-echo "=> Gợi ý: Tạo rule ví dụ TCP 0.0.0.0:$PANEL_PORT_KHAC → 10.0.0.2:27015 (game) ngay trên UI."
-echo "Logs:   journalctl -u ifw -n 200 --no-pager"
+IP=$(hostname -I | awk '{print $1}')
+echo "Done. Mở: http://$IP:${PORT}/adminsetupfw/"
+echo "• /api/connections giờ đọc nf_conntrack (DNAT) + UI tự refresh 2s ở tab 'Danh sách IP'."
+PATCH
