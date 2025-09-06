@@ -73,6 +73,7 @@ func defaultConfig() Config {
 		UdpBurst:     12000,
 	}
 }
+
 func getenvInt(k string, def int) int {
 	if v := os.Getenv(k); v != "" {
 		var x int
@@ -82,6 +83,7 @@ func getenvInt(k string, def int) int {
 	}
 	return def
 }
+
 func run(cmd string) error {
 	log.Println("[CMD]", cmd)
 	arr := strings.Fields(cmd)
@@ -91,6 +93,7 @@ func run(cmd string) error {
 	}
 	return err
 }
+
 func protoMap(p string) []string {
 	switch strings.ToLower(p) {
 	case "both", "all":
@@ -99,6 +102,7 @@ func protoMap(p string) []string {
 		return []string{strings.ToLower(p)}
 	}
 }
+
 func removeRuleSingle(r Rule, proto string) {
 	for _, table := range []string{"nat", "filter"} {
 		out, _ := exec.Command("iptables-save", "-t", table).Output()
@@ -113,6 +117,7 @@ func removeRuleSingle(r Rule, proto string) {
 		}
 	}
 }
+
 func applyWhitelistBypass(r Rule) {
 	id := r.ID
 	for _, p := range protoMap(r.Proto) {
@@ -120,6 +125,7 @@ func applyWhitelistBypass(r Rule) {
 			p, r.ToIP, r.ToPort, id))
 	}
 }
+
 func removeWhitelistBypass(r Rule) {
 	out, _ := exec.Command("iptables-save", "-t", "filter").Output()
 	for _, l := range strings.Split(string(out), "\n") {
@@ -132,6 +138,7 @@ func removeWhitelistBypass(r Rule) {
 		}
 	}
 }
+
 func applyDefense(r Rule) {
 	if !cfg.DDOSDefense {
 		return
@@ -151,6 +158,7 @@ func applyDefense(r Rule) {
 		}
 	}
 }
+
 func removeDefense(r Rule) {
 	for _, table := range []string{"raw", "mangle", "filter"} {
 		out, _ := exec.Command("iptables-save", "-t", table).Output()
@@ -165,6 +173,7 @@ func removeDefense(r Rule) {
 		}
 	}
 }
+
 func applyRule(r Rule) {
 	for _, p := range protoMap(r.Proto) {
 		removeRuleSingle(r, p)
@@ -177,6 +186,7 @@ func applyRule(r Rule) {
 	applyWhitelistBypass(r)
 	applyDefense(r)
 }
+
 func removeRule(r Rule) {
 	removeDefense(r)
 	removeWhitelistBypass(r)
@@ -184,6 +194,7 @@ func removeRule(r Rule) {
 		removeRuleSingle(r, proto)
 	}
 }
+
 func saveRules() {
 	f, _ := os.Create(rulesFile)
 	defer f.Close()
@@ -191,6 +202,7 @@ func saveRules() {
 	enc.SetIndent("", "  ")
 	enc.Encode(rules)
 }
+
 func loadRules() {
 	f, err := os.Open(rulesFile)
 	if err != nil {
@@ -199,6 +211,7 @@ func loadRules() {
 	defer f.Close()
 	_ = json.NewDecoder(f).Decode(&rules)
 }
+
 func saveConfig() error {
 	f, err := os.Create(configFile)
 	if err != nil {
@@ -209,6 +222,7 @@ func saveConfig() error {
 	enc.SetIndent("", "  ")
 	return enc.Encode(cfg)
 }
+
 func loadConfig() {
 	cfg = defaultConfig()
 	cfg.TcpSynPerIp = getenvInt("DDOS_TCP_SYN_PER_IP", cfg.TcpSynPerIp)
@@ -246,6 +260,7 @@ func loadConfig() {
 	}
 	_ = saveConfig()
 }
+
 func listIPSet(name string) ([]string, error) {
 	out, err := exec.Command("ipset", "list", name, "-o", "save").CombinedOutput()
 	if err != nil {
@@ -260,7 +275,9 @@ func listIPSet(name string) ([]string, error) {
 	}
 	return ips, nil
 }
+
 type ipReq struct{ IP string `json:"ip"` }
+
 func refreshDefenseAll() {
 	for _, r := range rules {
 		if r.Active {
@@ -481,36 +498,99 @@ func main() {
 		_ = json.NewEncoder(w).Encode(map[string]any{"set":"gofw_white","count":len(ips),"ips":ips})
 	})
 
-	// Connections endpoint (list IPs connecting to rule target ports)
+	// Connections endpoint — conntrack-based (thay vì ss)
 	mux.HandleFunc("/api/connections", func(w http.ResponseWriter, r *http.Request) {
 		type ConnInfo struct {
 			IP       string `json:"ip"`
 			Port     string `json:"port"`
+			Proto    string `json:"proto"`
 			RuleID   string `json:"rule"`
 			FromPort string `json:"fromPort"`
 			ToIP     string `json:"toIp"`
+			ToPort   string `json:"toPort"`
+			Count    int    `json:"count"`
 		}
-		conns := []ConnInfo{}
 
-		out, _ := exec.Command("ss", "-nt").Output()
+		// snapshot rules active để tránh race
+		mu.Lock()
+		activeRules := make([]Rule, 0, len(rules))
+		for _, ru := range rules {
+			if ru.Active {
+				activeRules = append(activeRules, ru)
+			}
+		}
+		mu.Unlock()
+
+		res := []ConnInfo{}
+		out, err := exec.Command("bash", "-lc", "conntrack -L 2>/dev/null").Output()
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(res)
+			return
+		}
+
+		// ruleID -> ip -> count
+		counts := map[string]map[string]int{}
 		lines := strings.Split(string(out), "\n")
 		for _, line := range lines {
-			f := strings.Fields(line)
-			if len(f) < 5 { continue }
-			remote := f[4]
-			remote = strings.Trim(remote, "[]")
-			parts := strings.Split(remote, ":")
-			if len(parts) < 2 { continue }
-			port := parts[len(parts)-1]
-			ip := strings.Join(parts[:len(parts)-1], ":")
-			for _, ru := range rules {
-				if ru.Active && ru.ToPort == port {
-					conns = append(conns, ConnInfo{IP: ip, Port: port, RuleID: ru.ID, FromPort: ru.FromPort, ToIP: ru.ToIP})
+			if !(strings.HasPrefix(line, "tcp") || strings.HasPrefix(line, "udp")) {
+				continue
+			}
+			proto := "tcp"
+			if strings.HasPrefix(line, "udp") {
+				proto = "udp"
+			}
+
+			toks := strings.Fields(line)
+			var firstSrc, firstDst, firstDport string
+			for _, t := range toks {
+				if strings.HasPrefix(t, "src=") && firstSrc == "" {
+					firstSrc = strings.TrimPrefix(t, "src=")
+				}
+				if strings.HasPrefix(t, "dst=") && firstDst == "" {
+					firstDst = strings.TrimPrefix(t, "dst=")
+				}
+				if strings.HasPrefix(t, "dport=") && firstDport == "" {
+					firstDport = strings.TrimPrefix(t, "dport=")
+				}
+			}
+			if firstSrc == "" || firstDst == "" || firstDport == "" {
+				continue
+			}
+
+			for _, ru := range activeRules {
+				for _, p := range protoMap(ru.Proto) {
+					if p != proto {
+						continue
+					}
+					if ru.ToIP == firstDst && ru.ToPort == firstDport {
+						if counts[ru.ID] == nil {
+							counts[ru.ID] = map[string]int{}
+						}
+						counts[ru.ID][firstSrc]++
+					}
 				}
 			}
 		}
+
+		for _, ru := range activeRules {
+			m := counts[ru.ID]
+			for ip, c := range m {
+				res = append(res, ConnInfo{
+					IP:       ip,
+					Port:     ru.ToPort,
+					Proto:    strings.ToLower(ru.Proto),
+					RuleID:   ru.ID,
+					FromPort: ru.FromPort,
+					ToIP:     ru.ToIP,
+					ToPort:   ru.ToPort,
+					Count:    c,
+				})
+			}
+		}
+
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(conns)
+		_ = json.NewEncoder(w).Encode(res)
 	})
 
 	// Suspected list (snapshot)
@@ -617,7 +697,7 @@ func main() {
 
 	log.Printf("GoPortPanel chạy tại http://0.0.0.0:%d/adminsetupfw/\n", port)
 
-	// Auto-block goroutine
+	// Auto-block goroutine (giữ ss -ntu cho chi phí thấp)
 	go func() {
 		for {
 			time.Sleep(15 * time.Second)
@@ -634,9 +714,8 @@ func main() {
 					counter[ip]++
 				}
 			}
-			// auto-block threshold (tùy chỉnh)
 			autoThreshold := cfg.TcpConnPerIp * 4
-			if autoThreshold < 200 { autoThreshold = 200 } // lower bound safety
+			if autoThreshold < 200 { autoThreshold = 200 }
 			for ip, c := range counter {
 				if c > autoThreshold {
 					if err := run(fmt.Sprintf("ipset add gofw_block %s -exist", ip)); err == nil {
@@ -694,7 +773,7 @@ cat > "$APP_DIR/frontend/index.html" <<'HTML'
 </html>
 HTML
 
-# Full App.vue with Lists tab + all UI
+# App.vue (đã hiện Connections: X + nút Block/Whitelist)
 cat > "$APP_DIR/frontend/src/App.vue" <<'VUE'
 <template>
   <div class="container py-5" style="max-width:1100px;">
@@ -880,7 +959,8 @@ cat > "$APP_DIR/frontend/src/App.vue" <<'VUE'
             <div v-for="c in connections" :key="'c-'+c.ip+'-'+c.port" class="d-flex justify-content-between align-items-center py-2 border-bottom">
               <div>
                 <div class="fw-semibold">{{ c.ip }}:{{ c.port }}</div>
-                <div class="small text-muted">Rule: {{ c.rule }} → {{ c.fromPort }} → {{ c.toIp }}</div>
+                <div class="small text-muted">Rule: {{ c.rule }} • {{ c.proto?.toUpperCase?.() || '' }} • Connections: {{ c.count }}</div>
+                <div class="small text-muted">Map: {{ c.fromPort }} → {{ c.toIp }}:{{ c.toPort }}</div>
               </div>
               <div class="btn-group">
                 <button class="btn btn-sm btn-outline-danger" @click="blockIP(c.ip)">Block</button>
@@ -1199,8 +1279,8 @@ echo
 echo "==> HOÀN TẤT! Panel: http://$IP:$PANEL_PORT/adminsetupfw/"
 echo "   • Forwarding: tạo/sửa/tạm dừng/xóa rule"
 echo "   • Block/Whitelist: quản IP ngay"
-echo "   • Lists: Connections / Suspected / Auto-blocked history"
+echo "   • Lists: Connections / Suspected / Auto-blocked history (conntrack-based)"
 echo "   • Rate Config: bật/tắt DDoS + ngưỡng, áp dụng tức thì"
 echo
 echo "==> Logs: systemctl status ifw -l | journalctl -u ifw -n 200 --no-pager"
-echo "==> If blocked by mistake, SSH via console/KVM để gỡ ipset/iptables"
+echo "==> Nếu lỡ chặn nhầm, SSH qua console/KVM để gỡ ipset/iptables"
