@@ -1,18 +1,17 @@
-bash -s -- 2020 <<'IFW_SCRIPT'
+bash -s -- 2020 <<'IFW_ALL'
 #!/usr/bin/env bash
 set -euo pipefail
-
 PANEL_PORT="${1:-2020}"
 APP_DIR="/opt/ifw"
 GO_VERSION="1.22.4"
 export DEBIAN_FRONTEND=noninteractive
 
-if [ "$(id -u)" -ne 0 ]; then echo "Please run as root"; exit 1; fi
+[ "$(id -u)" -eq 0 ] || { echo "Please run as root"; exit 1; }
 
-echo "==> Prepare dirs"
+echo "==> Dirs"
 mkdir -p "$APP_DIR/backend/public" /etc/ipset /etc/iptables
 
-echo "==> Install deps"
+echo "==> Deps"
 apt-get update -y >/dev/null
 apt-get install -y curl ca-certificates build-essential iptables iptables-persistent netfilter-persistent ipset conntrack jq >/dev/null
 
@@ -31,11 +30,11 @@ modprobe iptable_nat 2>/dev/null || true
 modprobe nf_synproxy_core 2>/dev/null || true
 modprobe xt_set 2>/dev/null || true
 
-# Optional: tắt tường lửa distro gây REJECT
+# Tắt firewall distro gây REJECT
 if command -v ufw >/dev/null 2>&1; then ufw disable || true; fi
 if systemctl is-active --quiet firewalld 2>/dev/null; then systemctl stop firewalld || true; systemctl disable firewalld || true; fi
 
-echo "==> Sysctl tune"
+echo "==> Sysctl"
 cat > /etc/sysctl.d/99-ifw-dnat.conf <<SYSCTL
 net.core.somaxconn=8192
 net.core.netdev_max_backlog=250000
@@ -54,7 +53,7 @@ net.netfilter.nf_conntrack_tcp_timeout_established=600
 SYSCTL
 sysctl --system >/dev/null || true
 
-echo "==> Base ipset/iptables"
+echo "==> Base iptables/ipset"
 ipset create gofw_block hash:ip family inet maxelem 200000 -exist
 ipset create gofw_white hash:ip family inet maxelem 100000 -exist
 iptables -t raw -C PREROUTING -m set --match-set gofw_block src -j DROP 2>/dev/null || \
@@ -66,7 +65,7 @@ iptables-save > /etc/iptables/rules.v4 || true
 ipset save > /etc/ipset/rules.v4 || true
 netfilter-persistent save || true
 
-echo "==> Backend (Go API + static UI)"
+echo "==> Backend"
 cat > "$APP_DIR/backend/go.mod" <<'GOMOD'
 module ifw
 go 1.22
@@ -100,6 +99,7 @@ type Rule struct {
 	TimeAdded time.Time `json:"timeAdded"`
 	Active    bool      `json:"active"`
 }
+
 type Config struct {
 	DDOSDefense  bool `json:"ddosDefense"`
 	TcpSynPerIp  int  `json:"tcpSynPerIp"`
@@ -147,12 +147,10 @@ func applyDefense(r Rule) {
 	id := r.ID
 	for _, p := range protoMap(r.Proto) {
 		if p=="tcp" {
-			// SYNPROXY trước DNAT, không NOTRACK -> NAT vẫn hoạt động
-			run(fmt.Sprintf(`iptables -t mangle -I PREROUTING -p tcp --dport %s -m conntrack --ctstate NEW,UNTRACKED -m comment --comment gofwdef-%s -j SYNPROXY --sack-perm --timestamp --wscale 7 --mss 1460`, r.FromPort, id))
-			// tránh RST "connection refused" local nếu DNAT lỗi
-			run(fmt.Sprintf(`iptables -I INPUT -p tcp --dport %s -m comment --comment gofwdef-%s -j DROP`, r.FromPort, id))
+			// SYNPROXY trên FORWARD (sau DNAT): ổn định với NAT
+			run(fmt.Sprintf(`iptables -I FORWARD -p tcp -d %s --dport %s -m conntrack --ctstate NEW -m comment --comment gofwdef-%s -j SYNPROXY --sack-perm --timestamp --wscale 7 --mss 1460`, r.ToIP, r.ToPort, id))
+			run(fmt.Sprintf(`iptables -I FORWARD -p tcp -d %s --dport %s -m conntrack --ctstate INVALID -m comment --comment gofwdef-%s -j DROP`, r.ToIP, r.ToPort, id))
 
-			run(fmt.Sprintf(`iptables -I FORWARD -m conntrack --ctstate INVALID -d %s --dport %s -m comment --comment gofwdef-%s -j DROP`, r.ToIP, r.ToPort, id))
 			run(fmt.Sprintf(`iptables -I FORWARD -p tcp -d %s --dport %s --syn -m hashlimit --hashlimit-above %d/second --hashlimit-burst %d --hashlimit-mode srcip --hashlimit-name syn-%s -m comment --comment gofwdef-%s -j DROP`,
 				r.ToIP, r.ToPort, cfg.TcpSynPerIp, cfg.TcpSynBurst, id, id))
 			run(fmt.Sprintf(`iptables -I FORWARD -p tcp -d %s --dport %s -m connlimit --connlimit-above %d --connlimit-mask 32 -m comment --comment gofwdef-%s -j DROP`,
@@ -185,12 +183,14 @@ func applySeenTracking(r Rule) {
 	createPerRuleSets(r)
 	id := r.ID
 	for _, p := range protoMap(r.Proto) {
+		// bắt SYN trước NAT (PREROUTING)
 		if p=="tcp" {
 			run(fmt.Sprintf(`iptables -t mangle -I PREROUTING -p tcp --dport %s --syn -m comment --comment gofwseen-%s -j SET --add-set gofw_syn_%s src`, r.FromPort, id, id))
 		}
 		if p=="udp" {
 			run(fmt.Sprintf(`iptables -t mangle -I PREROUTING -p udp --dport %s -m conntrack --ctstate NEW -m comment --comment gofwseen-%s -j SET --add-set gofw_syn_%s src`, r.FromPort, id, id))
 		}
+		// bắt EST sau DNAT (FORWARD)
 		run(fmt.Sprintf(`iptables -I FORWARD -p %s -d %s --dport %s -m comment --comment gofwseen-%s -j SET --add-set gofw_seen_%s src`, p, r.ToIP, r.ToPort, id, id))
 	}
 }
@@ -360,7 +360,7 @@ func main(){
 		w.Header().Set("Content-Type","application/json"); _=json.NewEncoder(w).Encode(map[string]any{"set":"gofw_white","count":len(ips),"ips":ips})
 	})
 
-	// block all current (from ipsets), skip whitelist
+	// block all current (snapshot from sets), skip whitelist
 	mux.HandleFunc("/api/blockall", func(w http.ResponseWriter, r *http.Request){
 		mu.Lock(); local := make([]Rule,0,len(rules)); for _,ru := range rules { if ru.Active { local=append(local,ru) } }; mu.Unlock()
 		whites := map[string]bool{}
@@ -406,7 +406,7 @@ func main(){
 }
 GO
 
-echo "==> Frontend (Vue CDN, UI đẹp/mượt)"
+echo "==> Frontend (Vue CDN, UI đẹp)"
 cat > "$APP_DIR/backend/public/index.html" <<'HTML'
 <!DOCTYPE html>
 <html lang="vi">
@@ -715,6 +715,5 @@ IP=$(curl -s4 https://api.ipify.org || hostname -I | awk '{print $1}')
 echo
 echo "==> HOÀN TẤT!"
 echo "Panel:  http://$IP:$PANEL_PORT/adminsetupfw/"
-echo "API:    /api/rules, /api/blocked, /api/whitelisted, /api/connections, /api/block, /api/whitelist"
-echo "Gợi ý:  tạo ít nhất 1 Rule, sang 'Danh sách IP' để xem realtime + block/whitelist."
-IFW_SCRIPT
+echo "Gợi ý: tạo 1 Rule rồi sang tab 'Danh sách IP' xem realtime & Block/Whitelist."
+IFW_ALL
