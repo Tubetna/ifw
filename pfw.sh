@@ -1,41 +1,49 @@
-bash -s -- 2020 <<'IFW_ALL'
 #!/usr/bin/env bash
+# IFW DNAT Panel – fixed forwarding installer (v3)
+# Usage examples:
+#   curl -fsSL https://example.com/ifw_v3.sh | bash -s -- 2020
+#   curl -fsSL ... | bash -s -- 2020 80 103.252.136.208 80   # (optional) auto-create rule: FROM=80 -> 103.252.136.208:80
+
 set -euo pipefail
 PANEL_PORT="${1:-2020}"
+AUTO_FROM="${2:-}"
+AUTO_TO_IP="${3:-}"
+AUTO_TO_PORT="${4:-}"
 APP_DIR="/opt/ifw"
 GO_VERSION="1.22.4"
 export DEBIAN_FRONTEND=noninteractive
 
 [ "$(id -u)" -eq 0 ] || { echo "Please run as root"; exit 1; }
 
-echo "==> Dirs"
+log(){ echo -e "\e[36m==>\e[0m $*"; }
+
+log "Create dirs"
 mkdir -p "$APP_DIR/backend/public" /etc/ipset /etc/iptables
 
-echo "==> Deps"
+log "Install deps"
 apt-get update -y >/dev/null
 apt-get install -y curl ca-certificates build-essential iptables iptables-persistent netfilter-persistent ipset conntrack jq >/dev/null
 
 if ! command -v go >/dev/null 2>&1; then
-  echo "==> Install Go $GO_VERSION"
+  log "Install Go $GO_VERSION"
   curl -sL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" | tar -xz -C /usr/local
   export PATH="/usr/local/go/bin:$PATH"
   grep -q '/usr/local/go/bin' /root/.profile || echo 'export PATH="/usr/local/go/bin:$PATH"' >> /root/.profile
 fi
 
-echo "==> Kernel modules"
+log "Kernel modules"
 modprobe ip_set 2>/dev/null || true
 modprobe ip_set_hash_ip 2>/dev/null || true
 modprobe nf_conntrack 2>/dev/null || true
 modprobe iptable_nat 2>/dev/null || true
-modprobe nf_synproxy_core 2>/dev/null || true
 modprobe xt_set 2>/dev/null || true
 
-# Tắt firewall distro gây REJECT
+# Disable distro firewalls that may REJECT before DNAT
 if command -v ufw >/dev/null 2>&1; then ufw disable || true; fi
 if systemctl is-active --quiet firewalld 2>/dev/null; then systemctl stop firewalld || true; systemctl disable firewalld || true; fi
 
-echo "==> Sysctl"
-cat > /etc/sysctl.d/99-ifw-dnat.conf <<SYSCTL
+log "Sysctl tuning (& enable forwarding)"
+cat > /etc/sysctl.d/99-ifw-dnat.conf <<'SYSCTL'
 net.core.somaxconn=8192
 net.core.netdev_max_backlog=250000
 net.core.rmem_max=67108864
@@ -46,6 +54,8 @@ net.ipv4.tcp_fastopen=3
 net.ipv4.tcp_max_syn_backlog=16384
 net.ipv4.tcp_syncookies=1
 net.ipv4.tcp_synack_retries=2
+net.ipv4.conf.all.rp_filter=0
+net.ipv4.conf.default.rp_filter=0
 net.netfilter.nf_conntrack_max=1048576
 net.netfilter.nf_conntrack_udp_timeout=30
 net.netfilter.nf_conntrack_udp_timeout_stream=120
@@ -53,21 +63,29 @@ net.netfilter.nf_conntrack_tcp_timeout_established=600
 SYSCTL
 sysctl --system >/dev/null || true
 
-echo "==> Base iptables/ipset"
+log "Base iptables/ipset"
 ipset create gofw_block hash:ip family inet maxelem 200000 -exist
 ipset create gofw_white hash:ip family inet maxelem 100000 -exist
+
+# Drop blocked IPs early (raw) – does not affect DNAT
 iptables -t raw -C PREROUTING -m set --match-set gofw_block src -j DROP 2>/dev/null || \
 iptables -t raw -I PREROUTING -m set --match-set gofw_block src -j DROP
+
+# Always allow established forwards
 iptables -C FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
 iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+# Make sure panel is reachable
 iptables -I INPUT -p tcp --dport "$PANEL_PORT" -j ACCEPT || true
+
 iptables-save > /etc/iptables/rules.v4 || true
 ipset save > /etc/ipset/rules.v4 || true
 netfilter-persistent save || true
 
-echo "==> Backend"
+log "Backend"
 cat > "$APP_DIR/backend/go.mod" <<'GOMOD'
 module ifw
+
 go 1.22
 GOMOD
 
@@ -117,28 +135,29 @@ var (
 	mu         sync.Mutex
 )
 
-func defaultConfig() Config { return Config{DDOSDefense:true, TcpSynPerIp:150, TcpSynBurst:300, TcpConnPerIp:250, UdpPpsPerIp:8000, UdpBurst:12000} }
+func defaultConfig() Config { return Config{DDOSDefense:false, TcpSynPerIp:150, TcpSynBurst:300, TcpConnPerIp:250, UdpPpsPerIp:8000, UdpBurst:12000} }
 func getenvInt(k string, def int) int { if v:=os.Getenv(k); v!="" { var x int; if _,e:=fmt.Sscanf(v,"%d",&x); e==nil && x>0 { return x } } ; return def }
 func run(cmd string) error { log.Println("[CMD]",cmd); a:=strings.Fields(cmd); out,err:=exec.Command(a[0],a[1:]...).CombinedOutput(); if err!=nil { log.Printf("[ERR] %s => %s",cmd,out) } ; return err }
 func protoMap(p string) []string { switch strings.ToLower(p){ case "both","all": return []string{"tcp","udp"} ; default: return []string{strings.ToLower(p)} } }
 
-func removeRuleSingle(r Rule, proto string) {
+func removeRuleSingle(r Rule) {
 	for _, table := range []string{"raw","mangle","nat","filter"} {
 		out, _ := exec.Command("iptables-save", "-t", table).Output()
 		for _, l := range strings.Split(string(out), "\n") {
-			if (strings.Contains(l,"gofw-"+r.ID) || strings.Contains(l,"gofwdef-"+r.ID) || strings.Contains(l,"gofwwhite-"+r.ID) || strings.Contains(l,"gofwseen-"+r.ID)) &&
-				(strings.Contains(l, proto) || proto=="both") {
+			if strings.Contains(l, "gofw-"+r.ID) || strings.Contains(l,"gofwdef-"+r.ID) || strings.Contains(l,"gofwwhite-"+r.ID) || strings.Contains(l,"gofwseen-"+r.ID) {
 				line := l; if strings.HasPrefix(line,"-A") { line = strings.Replace(line,"-A","-D",1) }
-				run(fmt.Sprintf("iptables -t %s %s", table, line))
+				_ = run(fmt.Sprintf("iptables -t %s %s", table, line))
 			}
 		}
 	}
+	_ = run(fmt.Sprintf("ipset destroy gofw_syn_%s 2>/dev/null || ipset flush gofw_syn_%s || true", r.ID, r.ID))
+	_ = run(fmt.Sprintf("ipset destroy gofw_seen_%s 2>/dev/null || ipset flush gofw_seen_%s || true", r.ID, r.ID))
 }
 
 func applyWhitelistBypass(r Rule) {
 	id := r.ID
 	for _, p := range protoMap(r.Proto) {
-		run(fmt.Sprintf(`iptables -I FORWARD -p %s -m set --match-set gofw_white src -d %s --dport %s -m comment --comment gofwwhite-%s -j ACCEPT`, p,r.ToIP,r.ToPort,id))
+		_ = run(fmt.Sprintf(`iptables -I FORWARD -p %s -m set --match-set gofw_white src -d %s --dport %s -m comment --comment gofwwhite-%s -j ACCEPT`, p,r.ToIP,r.ToPort,id))
 	}
 }
 
@@ -147,63 +166,46 @@ func applyDefense(r Rule) {
 	id := r.ID
 	for _, p := range protoMap(r.Proto) {
 		if p=="tcp" {
-			// SYNPROXY trên FORWARD (sau DNAT): ổn định với NAT
-			run(fmt.Sprintf(`iptables -I FORWARD -p tcp -d %s --dport %s -m conntrack --ctstate NEW -m comment --comment gofwdef-%s -j SYNPROXY --sack-perm --timestamp --wscale 7 --mss 1460`, r.ToIP, r.ToPort, id))
-			run(fmt.Sprintf(`iptables -I FORWARD -p tcp -d %s --dport %s -m conntrack --ctstate INVALID -m comment --comment gofwdef-%s -j DROP`, r.ToIP, r.ToPort, id))
-
-			run(fmt.Sprintf(`iptables -I FORWARD -p tcp -d %s --dport %s --syn -m hashlimit --hashlimit-above %d/second --hashlimit-burst %d --hashlimit-mode srcip --hashlimit-name syn-%s -m comment --comment gofwdef-%s -j DROP`,
-				r.ToIP, r.ToPort, cfg.TcpSynPerIp, cfg.TcpSynBurst, id, id))
-			run(fmt.Sprintf(`iptables -I FORWARD -p tcp -d %s --dport %s -m connlimit --connlimit-above %d --connlimit-mask 32 -m comment --comment gofwdef-%s -j DROP`,
-				r.ToIP, r.ToPort, cfg.TcpConnPerIp, id))
+			_ = run(fmt.Sprintf(`iptables -I FORWARD -p tcp -d %s --dport %s --syn -m hashlimit --hashlimit-above %d/second --hashlimit-burst %d --hashlimit-mode srcip --hashlimit-name syn-%s -m comment --comment gofwdef-%s -j DROP`, r.ToIP, r.ToPort, cfg.TcpSynPerIp, cfg.TcpSynBurst, id, id))
+			_ = run(fmt.Sprintf(`iptables -I FORWARD -p tcp -d %s --dport %s -m connlimit --connlimit-above %d --connlimit-mask 32 -m comment --comment gofwdef-%s -j DROP`, r.ToIP, r.ToPort, cfg.TcpConnPerIp, id))
 		}
 		if p=="udp" {
-			run(fmt.Sprintf(`iptables -I FORWARD -p udp -d %s --dport %s -m conntrack --ctstate NEW -m hashlimit --hashlimit-above %d/second --hashlimit-burst %d --hashlimit-mode srcip --hashlimit-name udpf-%s -m comment --comment gofwdef-%s -j DROP`,
-				r.ToIP, r.ToPort, cfg.UdpPpsPerIp, cfg.UdpBurst, id, id))
+			_ = run(fmt.Sprintf(`iptables -I FORWARD -p udp -d %s --dport %s -m conntrack --ctstate NEW -m hashlimit --hashlimit-above %d/second --hashlimit-burst %d --hashlimit-mode srcip --hashlimit-name udpf-%s -m comment --comment gofwdef-%s -j DROP`, r.ToIP, r.ToPort, cfg.UdpPpsPerIp, cfg.UdpBurst, id, id))
 		}
 	}
-	run("iptables -C FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT")
+	_ = run("iptables -C FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT")
 }
 
 func applyDNAT(r Rule) {
 	id := r.ID
 	for _, p := range protoMap(r.Proto) {
-		run(fmt.Sprintf("iptables -t nat -I PREROUTING -p %s --dport %s -m comment --comment gofw-%s -j DNAT --to-destination %s:%s", p, r.FromPort, id, r.ToIP, r.ToPort))
-		run(fmt.Sprintf("iptables -t nat -I POSTROUTING -p %s -d %s --dport %s -m comment --comment gofw-%s -j MASQUERADE", p, r.ToIP, r.ToPort, id))
-		run(fmt.Sprintf("iptables -I FORWARD -p %s -d %s --dport %s -m comment --comment gofw-%s -j ACCEPT", p, r.ToIP, r.ToPort, id))
-		run(fmt.Sprintf("iptables -I FORWARD -p %s -s %s --sport %s -m comment --comment gofw-%s -j ACCEPT", p, r.ToIP, r.ToPort, id))
+		_ = run(fmt.Sprintf("iptables -t nat -I PREROUTING -p %s --dport %s -m comment --comment gofw-%s -j DNAT --to-destination %s:%s", p, r.FromPort, id, r.ToIP, r.ToPort))
+		_ = run(fmt.Sprintf("iptables -t nat -I POSTROUTING -p %s -d %s --dport %s -m comment --comment gofw-%s -j MASQUERADE", p, r.ToIP, r.ToPort, id))
+		_ = run(fmt.Sprintf("iptables -I FORWARD -p %s -d %s --dport %s -m comment --comment gofw-%s -j ACCEPT", p, r.ToIP, r.ToPort, id))
+		_ = run(fmt.Sprintf("iptables -I FORWARD -p %s -s %s --sport %s -m comment --comment gofw-%s -j ACCEPT", p, r.ToIP, r.ToPort, id))
 	}
 }
 
 func createPerRuleSets(r Rule) {
-	run(fmt.Sprintf("ipset create gofw_syn_%s  hash:ip timeout 60 counters -exist", r.ID))
-	run(fmt.Sprintf("ipset create gofw_seen_%s hash:ip timeout 180 counters -exist", r.ID))
+	_ = run(fmt.Sprintf("ipset create gofw_syn_%s  hash:ip timeout 60 counters -exist", r.ID))
+	_ = run(fmt.Sprintf("ipset create gofw_seen_%s hash:ip timeout 180 counters -exist", r.ID))
 }
 
 func applySeenTracking(r Rule) {
 	createPerRuleSets(r)
 	id := r.ID
 	for _, p := range protoMap(r.Proto) {
-		// bắt SYN trước NAT (PREROUTING)
-		if p=="tcp" {
-			run(fmt.Sprintf(`iptables -t mangle -I PREROUTING -p tcp --dport %s --syn -m comment --comment gofwseen-%s -j SET --add-set gofw_syn_%s src`, r.FromPort, id, id))
-		}
-		if p=="udp" {
-			run(fmt.Sprintf(`iptables -t mangle -I PREROUTING -p udp --dport %s -m conntrack --ctstate NEW -m comment --comment gofwseen-%s -j SET --add-set gofw_syn_%s src`, r.FromPort, id, id))
-		}
-		// bắt EST sau DNAT (FORWARD)
-		run(fmt.Sprintf(`iptables -I FORWARD -p %s -d %s --dport %s -m comment --comment gofwseen-%s -j SET --add-set gofw_seen_%s src`, p, r.ToIP, r.ToPort, id, id))
+		if p=="tcp" { _ = run(fmt.Sprintf(`iptables -t mangle -I PREROUTING -p tcp --dport %s --syn -m comment --comment gofwseen-%s -j SET --add-set gofw_syn_%s src`, r.FromPort, id, id)) }
+		if p=="udp" { _ = run(fmt.Sprintf(`iptables -t mangle -I PREROUTING -p udp --dport %s -m conntrack --ctstate NEW -m comment --comment gofwseen-%s -j SET --add-set gofw_syn_%s src`, r.FromPort, id, id)) }
+		_ = run(fmt.Sprintf(`iptables -I FORWARD -p %s -d %s --dport %s -m comment --comment gofwseen-%s -j SET --add-set gofw_seen_%s src`, p, r.ToIP, r.ToPort, id, id))
 	}
 }
 
 func applyRule(r Rule){ applyWhitelistBypass(r); applyDefense(r); applyDNAT(r); applySeenTracking(r) }
-func removeRule(r Rule){
-	removeRuleSingle(r,"both")
-	_ = run(fmt.Sprintf("ipset destroy gofw_syn_%s 2>/dev/null || ipset flush gofw_syn_%s || true", r.ID, r.ID))
-	_ = run(fmt.Sprintf("ipset destroy gofw_seen_%s 2>/dev/null || ipset flush gofw_seen_%s || true", r.ID, r.ID))
-}
 
 func saveRules(){ f,_:=os.Create(rulesFile); defer f.Close(); enc:=json.NewEncoder(f); enc.SetIndent("","  "); _=enc.Encode(rules) }
 func loadRules(){ f,err:=os.Open(rulesFile); if err!=nil { return }; defer f.Close(); _=json.NewDecoder(f).Decode(&rules) }
+
 func saveConfig() error { f,err:=os.Create(configFile); if err!=nil { return err }; defer f.Close(); enc:=json.NewEncoder(f); enc.SetIndent("","  "); return enc.Encode(cfg) }
 func loadConfig(){
 	cfg=defaultConfig()
@@ -212,19 +214,8 @@ func loadConfig(){
 	cfg.TcpConnPerIp=getenvInt("DDOS_TCP_CONN_PER_IP",cfg.TcpConnPerIp)
 	cfg.UdpPpsPerIp=getenvInt("DDOS_UDP_PPS_PER_IP",cfg.UdpPpsPerIp)
 	cfg.UdpBurst=getenvInt("DDOS_UDP_BURST",cfg.UdpBurst)
-	if os.Getenv("DDOS_DEFENSE")=="0" { cfg.DDOSDefense=false }
-	if f,err:=os.Open(configFile); err==nil {
-		defer f.Close()
-		var c Config
-		if json.NewDecoder(f).Decode(&c)==nil {
-			if c.TcpSynPerIp>0 { cfg.TcpSynPerIp=c.TcpSynPerIp }
-			if c.TcpSynBurst>0 { cfg.TcpSynBurst=c.TcpSynBurst }
-			if c.TcpConnPerIp>0 { cfg.TcpConnPerIp=c.TcpConnPerIp }
-			if c.UdpPpsPerIp>0 { cfg.UdpPpsPerIp=c.UdpPpsPerIp }
-			if c.UdpBurst>0 { cfg.UdpBurst=c.UdpBurst }
-			cfg.DDOSDefense=c.DDOSDefense
-		}
-	}
+	if os.Getenv("DDOS_DEFENSE")=="1" { cfg.DDOSDefense=true }
+	if f,err:=os.Open(configFile); err==nil { defer f.Close(); _=json.NewDecoder(f).Decode(&cfg) }
 	_ = saveConfig()
 }
 
@@ -238,11 +229,8 @@ func readIPSetCounts(name string) ([]ipCount, error) {
 		if !strings.HasPrefix(l, "add "+name+" ") { continue }
 		fields := strings.Fields(strings.TrimPrefix(l, "add "+name+" "))
 		if len(fields)==0 { continue }
-		ip := fields[0]; pkts := 0
-		for i:=1; i<len(fields)-1; i++ {
-			if fields[i]=="packets" { if v,err := strconv.Atoi(fields[i+1]); err==nil { pkts=v } }
-		}
-		if pkts==0 { pkts=1 }
+		ip := fields[0]; pkts := 1
+		for i:=1; i<len(fields)-1; i++ { if fields[i]=="packets" { if v,err := strconv.Atoi(fields[i+1]); err==nil { pkts=v } } }
 		res = append(res, ipCount{IP:ip,Pkts:pkts})
 	}
 	return res, nil
@@ -257,7 +245,7 @@ func main(){
 
 	_ = run("ipset create gofw_block hash:ip family inet maxelem 200000 -exist")
 	_ = run("ipset create gofw_white hash:ip family inet maxelem 100000 -exist")
-	_ = run("iptables -t raw -C PREROUTING -m set --match-set gofw_block src -j DROP 2>/dev/null || iptables -t raw -I PREROUTING -m set --match-set gofw_block src -j DROP")
+	_ = run("iptables -t raw -C PREROUTING -m set --match-set gofw_block src -j DROP || iptables -t raw -I PREROUTING -m set --match-set gofw_block src -j DROP")
 	_ = run("iptables -C FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT")
 
 	loadConfig(); loadRules()
@@ -270,8 +258,7 @@ func main(){
 	mux.HandleFunc("/api/rules", func(w http.ResponseWriter, r *http.Request){
 		mu.Lock(); defer mu.Unlock()
 		switch r.Method {
-		case "GET":
-			w.Header().Set("Content-Type","application/json"); _=json.NewEncoder(w).Encode(rules)
+		case "GET": w.Header().Set("Content-Type","application/json"); _=json.NewEncoder(w).Encode(rules)
 		case "POST":
 			var in Rule; b,_ := io.ReadAll(r.Body)
 			if json.Unmarshal(b,&in)!=nil || in.FromPort=="" || in.ToIP=="" || in.ToPort=="" { http.Error(w,"invalid json",400); return }
@@ -283,6 +270,7 @@ func main(){
 		default: http.Error(w,"Method not allowed",405)
 		}
 	})
+
 	mux.HandleFunc("/api/rules/", func(w http.ResponseWriter, r *http.Request){
 		mu.Lock(); defer mu.Unlock()
 		id := strings.TrimPrefix(r.URL.Path,"/api/rules/")
@@ -291,17 +279,16 @@ func main(){
 		if idx==-1 { http.Error(w,"not found",404); return }
 		switch {
 		case r.Method=="DELETE":
-			removeRule(rules[idx]); rules = append(rules[:idx], rules[idx+1:]...); saveRules(); w.WriteHeader(204)
+			removeRuleSingle(rules[idx]); rules = append(rules[:idx], rules[idx+1:]...); saveRules(); w.WriteHeader(204)
 		case r.Method=="POST" && strings.HasSuffix(r.URL.Path,"/toggle"):
 			rules[idx].Active = !rules[idx].Active
-			if rules[idx].Active { applyRule(rules[idx]) } else { removeRule(rules[idx]) }
+			if rules[idx].Active { applyRule(rules[idx]) } else { removeRuleSingle(rules[idx]) }
 			saveRules(); w.Header().Set("Content-Type","application/json"); _=json.NewEncoder(w).Encode(rules[idx])
 		case r.Method=="PUT":
 			var in Rule; b,_ := io.ReadAll(r.Body)
 			if json.Unmarshal(b,&in)!=nil { http.Error(w,"invalid json",400); return }
-			for i,x := range rules { if i!=idx && x.FromPort==in.FromPort && strings.EqualFold(x.Proto,in.Proto) && x.Active { http.Error(w,"Port này đã được forward!",409); return } }
 			was := rules[idx].Active
-			if was { removeRuleSingle(rules[idx],"both") }
+			if was { removeRuleSingle(rules[idx]) }
 			rules[idx].Proto=in.Proto; rules[idx].FromPort=in.FromPort; rules[idx].ToIP=in.ToIP; rules[idx].ToPort=in.ToPort
 			if was { applyRule(rules[idx]) }
 			saveRules(); w.Header().Set("Content-Type","application/json"); _=json.NewEncoder(w).Encode(rules[idx])
@@ -309,7 +296,7 @@ func main(){
 		}
 	})
 
-	// block/unblock/list
+	// blocklist & whitelist
 	type ipReq struct{ IP string `json:"ip"` }
 	mux.HandleFunc("/api/block", func(w http.ResponseWriter, r *http.Request){
 		if r.Method!="POST" { http.Error(w,"Method not allowed",405); return }
@@ -329,10 +316,7 @@ func main(){
 		out,err := exec.Command("ipset","list","gofw_block","-o","save").CombinedOutput()
 		if err!=nil { http.Error(w,err.Error(),500); return }
 		ips := []string{}
-		for _, l := range strings.Split(string(out), "\n") {
-			f := strings.Fields(l)
-			if len(f)==3 && f[0]=="add" && f[1]=="gofw_block" { ips = append(ips, f[2]) }
-		}
+		for _, l := range strings.Split(string(out), "\n") { f := strings.Fields(l); if len(f)==3 && f[0]=="add" && f[1]=="gofw_block" { ips = append(ips, f[2]) } }
 		w.Header().Set("Content-Type","application/json"); _=json.NewEncoder(w).Encode(map[string]any{"set":"gofw_block","count":len(ips),"ips":ips})
 	})
 	mux.HandleFunc("/api/whitelist", func(w http.ResponseWriter, r *http.Request){
@@ -353,14 +337,11 @@ func main(){
 		out,err := exec.Command("ipset","list","gofw_white","-o","save").CombinedOutput()
 		if err!=nil { http.Error(w,err.Error(),500); return }
 		ips := []string{}
-		for _, l := range strings.Split(string(out), "\n") {
-			f := strings.Fields(l)
-			if len(f)==3 && f[0]=="add" && f[1]=="gofw_white" { ips = append(ips, f[2]) }
-		}
+		for _, l := range strings.Split(string(out), "\n") { f := strings.Fields(l); if len(f)==3 && f[0]=="add" && f[1]=="gofw_white" { ips = append(ips, f[2]) } }
 		w.Header().Set("Content-Type","application/json"); _=json.NewEncoder(w).Encode(map[string]any{"set":"gofw_white","count":len(ips),"ips":ips})
 	})
 
-	// block all current (snapshot from sets), skip whitelist
+	// block all current (snapshot) – skip whitelist
 	mux.HandleFunc("/api/blockall", func(w http.ResponseWriter, r *http.Request){
 		mu.Lock(); local := make([]Rule,0,len(rules)); for _,ru := range rules { if ru.Active { local=append(local,ru) } }; mu.Unlock()
 		whites := map[string]bool{}
@@ -370,35 +351,41 @@ func main(){
 		for _,ru := range local {
 			for _,set := range []string{"gofw_syn_"+ru.ID,"gofw_seen_"+ru.ID} {
 				if out,err := exec.Command("ipset","list",set,"-o","save").CombinedOutput(); err==nil {
-					for _,l := range strings.Split(string(out),"\n"){ f:=strings.Fields(l); if len(f)>=3 && f[0]=="add" && f[1]==set { ip:=f[2]; if !whites[ip]{ _=run(fmt.Sprintf("ipset add gofw_block %s -exist",ip)) } } }
+					for _,l := range strings.Split(string(out),"\n"){ f:=strings.Fields(l); if len(f)>=3 && f[0]=="add" && f[1]==set { ip:=f[2]; if !whites[ip]{ _=run(fmt.Sprintf("ipset add gofw_block %s -exist",ip)) } }
 				}
 			}
 		}
 		w.WriteHeader(204)
 	})
 
-	// realtime connections (EST & SYN per rule)
+	// realtime connections
 	mux.HandleFunc("/api/connections", func(w http.ResponseWriter, r *http.Request){
-		type Conn struct {
-			IP string `json:"ip"`
-			Phase string `json:"phase"` // EST|SYN
-			FromPort string `json:"fromPort"`
-			ToIP string `json:"toIp"`
-			ToPort string `json:"toPort"`
-			RuleID string `json:"rule"`
-			Count int `json:"count"`
-		}
+		type Conn struct { IP, Phase, FromPort, ToIP, ToPort, RuleID string; Count int }
 		out := []Conn{}
 		mu.Lock(); local := make([]Rule,0,len(rules)); for _,ru := range rules { if ru.Active { local=append(local,ru) } }; mu.Unlock()
 		for _, ru := range local {
-			if seen,err := readIPSetCounts("gofw_seen_"+ru.ID); err==nil {
-				for _, e := range seen { out = append(out, Conn{IP:e.IP, Phase:"EST", FromPort:ru.FromPort, ToIP:ru.ToIP, ToPort:ru.ToPort, RuleID:ru.ID, Count:e.Pkts}) }
-			}
-			if syns,err := readIPSetCounts("gofw_syn_"+ru.ID); err==nil {
-				for _, e := range syns { out = append(out, Conn{IP:e.IP, Phase:"SYN", FromPort:ru.FromPort, ToIP:ru.ToIP, ToPort:ru.ToPort, RuleID:ru.ID, Count:e.Pkts}) }
-			}
+			if seen,err := readIPSetCounts("gofw_seen_"+ru.ID); err==nil { for _, e := range seen { out = append(out, Conn{IP:e.IP, Phase:"EST", FromPort:ru.FromPort, ToIP:ru.ToIP, ToPort:ru.ToPort, RuleID:ru.ID, Count:e.Pkts}) } }
+			if syns,err := readIPSetCounts("gofw_syn_"+ru.ID); err==nil { for _, e := range syns { out = append(out, Conn{IP:e.IP, Phase:"SYN", FromPort:ru.FromPort, ToIP:ru.ToIP, ToPort:ru.ToPort, RuleID:ru.ID, Count:e.Pkts}) } }
 		}
 		w.Header().Set("Content-Type","application/json"); _=json.NewEncoder(w).Encode(out)
+	})
+
+	// config endpoints (GET/PUT)
+	mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request){
+		switch r.Method {
+		case "GET": w.Header().Set("Content-Type","application/json"); _=json.NewEncoder(w).Encode(cfg)
+		case "PUT":
+			var in Config; b,_ := io.ReadAll(r.Body)
+			if json.Unmarshal(b,&in)!=nil { http.Error(w,"invalid json",400); return }
+			// re-apply defense thresholds
+			mu.Lock(); old := cfg; cfg = in; _ = saveConfig(); mu.Unlock()
+			if old.DDOSDefense != cfg.DDOSDefense || old.TcpSynPerIp!=cfg.TcpSynPerIp || old.TcpSynBurst!=cfg.TcpSynBurst || old.TcpConnPerIp!=cfg.TcpConnPerIp || old.UdpPpsPerIp!=cfg.UdpPpsPerIp || old.UdpBurst!=cfg.UdpBurst {
+				mu.Lock(); local := make([]Rule,0,len(rules)); for _,ru := range rules { if ru.Active { local=append(local,ru) } }; mu.Unlock()
+				for _, ru := range local { removeRuleSingle(ru); applyRule(ru) }
+			}
+			w.WriteHeader(204)
+		default: http.Error(w,"Method not allowed",405)
+		}
 	})
 
 	log.Printf("IFW DNAT Panel http://0.0.0.0:%d/adminsetupfw/\n", port)
@@ -406,7 +393,7 @@ func main(){
 }
 GO
 
-echo "==> Frontend (Vue CDN, UI đẹp)"
+log "Frontend (Bootstrap + Vue)"
 cat > "$APP_DIR/backend/public/index.html" <<'HTML'
 <!DOCTYPE html>
 <html lang="vi">
@@ -435,7 +422,7 @@ cat > "$APP_DIR/backend/public/index.html" <<'HTML'
   <div id="app" class="container py-5" style="max-width:1180px">
     <div class="text-center mb-4">
       <h1 class="hero fw-800">IFW DNAT Panel</h1>
-      <div class="muted">Kernel DNAT • SYNPROXY • hashlimit/connlimit • raw-drop • Whitelist bypass</div>
+      <div class="muted">Kernel DNAT • hashlimit/connlimit • raw-drop • Whitelist bypass</div>
     </div>
 
     <ul class="nav nav-pills justify-content-center gap-2 mb-4">
@@ -625,7 +612,7 @@ cat > "$APP_DIR/backend/public/index.html" <<'HTML'
         const form = ref({ proto:'tcp', fromPort:'', toIp:'', toPort:'' })
         const rows = ref([]), blocked = ref([]), white = ref([])
         const blkIp = ref(""), wIp = ref(""), q = ref("")
-        const cfg = ref({ ddosDefense:true, tcpSynPerIp:150, tcpSynBurst:300, tcpConnPerIp:250, udpPpsPerIp:8000, udpBurst:12000 })
+        const cfg = ref({ ddosDefense:false, tcpSynPerIp:150, tcpSynBurst:300, tcpConnPerIp:250, udpPpsPerIp:8000, udpBurst:12000 })
         const fmt = t => t? new Date(t).toLocaleString('vi'):''
         const flash = (m,cls='alert-success') => { toast.value={msg:m,cls}; setTimeout(()=>toast.value=null,1600) }
         const go = t => { tab.value=t; if(t==='rules') fetchRules(); if(t==='lists') loadLists(); if(t==='blocked'){loadBlock()} if(t==='whitelist'){loadWhite()} if(t==='rate'){loadCfg()} }
@@ -674,11 +661,11 @@ cat > "$APP_DIR/backend/public/index.html" <<'HTML'
 </html>
 HTML
 
-echo "==> Build & service"
+log "Build & service"
 cd "$APP_DIR/backend"
 [ -f rules.json ] || { echo "[]" > rules.json; chmod 666 rules.json; }
 [ -f config.json ] || { cat > config.json <<JSON
-{ "ddosDefense": true, "tcpSynPerIp": 150, "tcpSynBurst": 300, "tcpConnPerIp": 250, "udpPpsPerIp": 8000, "udpBurst": 12000 }
+{ "ddosDefense": false, "tcpSynPerIp": 150, "tcpSynBurst": 300, "tcpConnPerIp": 250, "udpPpsPerIp": 8000, "udpBurst": 12000 }
 JSON
 chmod 666 config.json; }
 
@@ -693,7 +680,7 @@ After=network.target
 
 [Service]
 WorkingDirectory=$APP_DIR/backend
-Environment=DDOS_DEFENSE=1
+Environment=DDOS_DEFENSE=0
 Environment=DDOS_TCP_SYN_PER_IP=150
 Environment=DDOS_TCP_SYN_BURST=300
 Environment=DDOS_TCP_CONN_PER_IP=250
@@ -711,9 +698,24 @@ systemctl daemon-reload
 systemctl enable --now ifw.service >/dev/null
 systemctl restart ifw.service
 
-IP=$(curl -s4 https://api.ipify.org || hostname -I | awk '{print $1}')
-echo
-echo "==> HOÀN TẤT!"
-echo "Panel:  http://$IP:$PANEL_PORT/adminsetupfw/"
-echo "Gợi ý: tạo 1 Rule rồi sang tab 'Danh sách IP' xem realtime & Block/Whitelist."
-IFW_ALL
+# Optional: auto-create a rule from CLI arguments (for quick testing)
+if [[ -n "$AUTO_FROM" && -n "$AUTO_TO_IP" && -n "$AUTO_TO_PORT" ]]; then
+  log "Auto-create rule: $AUTO_FROM -> $AUTO_TO_IP:$AUTO_TO_PORT (tcp)"
+  curl -sS -X POST -H 'Content-Type: application/json' \
+    -d "{\"proto\":\"tcp\",\"fromPort\":\"$AUTO_FROM\",\"toIp\":\"$AUTO_TO_IP\",\"toPort\":\"$AUTO_TO_PORT\"}" \
+    "http://127.0.0.1:$PANEL_PORT/api/rules" >/dev/null || true
+fi
+
+PUB_IP=$(curl -s4 https://api.ipify.org || hostname -I | awk '{print $1}')
+cat <<MSG
+
+==> DONE!
+Panel:  http://$PUB_IP:$PANEL_PORT/adminsetupfw/
+Tip:   Tạo rule From=80 -> To=103.252.136.208:80 rồi test lại.
+
+QUICK DEBUG (nếu vẫn timeout):
+  1) Mở inbound trên Security Group của VPS (port bạn forward, VD: 80). Ảnh đỏ "Connection timed out" thường do SG chặn.
+  2) Kiểm tra rule DNAT: iptables -t nat -S PREROUTING | grep -- '--dport 80'
+  3) Bắt gói: tcpdump -n -i any 'tcp and port 80'  (phải thấy SYN tới VPS và SYN+ACK từ đích quay lại)
+  4) rp_filter đã tắt trong /etc/sysctl.d/99-ifw-dnat.conf
+MSG
