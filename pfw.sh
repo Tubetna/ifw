@@ -1,21 +1,29 @@
-bash -s -- 2020 <<'PATCH'
+bash -s -- 2020 <<'IFW_SCRIPT'
+#!/usr/bin/env bash
 set -euo pipefail
+
 PANEL_PORT="${1:-2020}"
 APP_DIR="/opt/ifw"
 GO_VERSION="1.22.4"
 export DEBIAN_FRONTEND=noninteractive
 
+if [ "$(id -u)" -ne 0 ]; then echo "Please run as root"; exit 1; fi
+
+echo "==> Prepare dirs"
 mkdir -p "$APP_DIR/backend/public" /etc/ipset /etc/iptables
 
-# --- deps & modules ---
+echo "==> Install deps"
 apt-get update -y >/dev/null
 apt-get install -y curl ca-certificates build-essential iptables iptables-persistent netfilter-persistent ipset conntrack jq >/dev/null
+
 if ! command -v go >/dev/null 2>&1; then
+  echo "==> Install Go $GO_VERSION"
   curl -sL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" | tar -xz -C /usr/local
   export PATH="/usr/local/go/bin:$PATH"
   grep -q '/usr/local/go/bin' /root/.profile || echo 'export PATH="/usr/local/go/bin:$PATH"' >> /root/.profile
 fi
 
+echo "==> Kernel modules"
 modprobe ip_set 2>/dev/null || true
 modprobe ip_set_hash_ip 2>/dev/null || true
 modprobe nf_conntrack 2>/dev/null || true
@@ -23,11 +31,30 @@ modprobe iptable_nat 2>/dev/null || true
 modprobe nf_synproxy_core 2>/dev/null || true
 modprobe xt_set 2>/dev/null || true
 
-# optional: tắt ufw/firewalld để tránh REJECT local
+# Optional: tắt tường lửa distro gây REJECT
 if command -v ufw >/dev/null 2>&1; then ufw disable || true; fi
 if systemctl is-active --quiet firewalld 2>/dev/null; then systemctl stop firewalld || true; systemctl disable firewalld || true; fi
 
-# --- base ipset/iptables ---
+echo "==> Sysctl tune"
+cat > /etc/sysctl.d/99-ifw-dnat.conf <<SYSCTL
+net.core.somaxconn=8192
+net.core.netdev_max_backlog=250000
+net.core.rmem_max=67108864
+net.core.wmem_max=67108864
+net.ipv4.ip_forward=1
+net.ipv4.tcp_congestion_control=bbr
+net.ipv4.tcp_fastopen=3
+net.ipv4.tcp_max_syn_backlog=16384
+net.ipv4.tcp_syncookies=1
+net.ipv4.tcp_synack_retries=2
+net.netfilter.nf_conntrack_max=1048576
+net.netfilter.nf_conntrack_udp_timeout=30
+net.netfilter.nf_conntrack_udp_timeout_stream=120
+net.netfilter.nf_conntrack_tcp_timeout_established=600
+SYSCTL
+sysctl --system >/dev/null || true
+
+echo "==> Base ipset/iptables"
 ipset create gofw_block hash:ip family inet maxelem 200000 -exist
 ipset create gofw_white hash:ip family inet maxelem 100000 -exist
 iptables -t raw -C PREROUTING -m set --match-set gofw_block src -j DROP 2>/dev/null || \
@@ -35,9 +62,11 @@ iptables -t raw -I PREROUTING -m set --match-set gofw_block src -j DROP
 iptables -C FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
 iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 iptables -I INPUT -p tcp --dport "$PANEL_PORT" -j ACCEPT || true
+iptables-save > /etc/iptables/rules.v4 || true
+ipset save > /etc/ipset/rules.v4 || true
 netfilter-persistent save || true
 
-# --- backend (Go) ---
+echo "==> Backend (Go API + static UI)"
 cat > "$APP_DIR/backend/go.mod" <<'GOMOD'
 module ifw
 go 1.22
@@ -56,7 +85,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -95,7 +123,7 @@ func run(cmd string) error { log.Println("[CMD]",cmd); a:=strings.Fields(cmd); o
 func protoMap(p string) []string { switch strings.ToLower(p){ case "both","all": return []string{"tcp","udp"} ; default: return []string{strings.ToLower(p)} } }
 
 func removeRuleSingle(r Rule, proto string) {
-	for _, table := range []string{"raw","mangle","nat","filter","security"} {
+	for _, table := range []string{"raw","mangle","nat","filter"} {
 		out, _ := exec.Command("iptables-save", "-t", table).Output()
 		for _, l := range strings.Split(string(out), "\n") {
 			if (strings.Contains(l,"gofw-"+r.ID) || strings.Contains(l,"gofwdef-"+r.ID) || strings.Contains(l,"gofwwhite-"+r.ID) || strings.Contains(l,"gofwseen-"+r.ID)) &&
@@ -119,9 +147,9 @@ func applyDefense(r Rule) {
 	id := r.ID
 	for _, p := range protoMap(r.Proto) {
 		if p=="tcp" {
-			// SYNPROXY trước DNAT nhưng KHÔNG notrack -> NAT vẫn hoạt động
+			// SYNPROXY trước DNAT, không NOTRACK -> NAT vẫn hoạt động
 			run(fmt.Sprintf(`iptables -t mangle -I PREROUTING -p tcp --dport %s -m conntrack --ctstate NEW,UNTRACKED -m comment --comment gofwdef-%s -j SYNPROXY --sack-perm --timestamp --wscale 7 --mss 1460`, r.FromPort, id))
-			// tránh "connection refused" local nếu DNAT lỗi
+			// tránh RST "connection refused" local nếu DNAT lỗi
 			run(fmt.Sprintf(`iptables -I INPUT -p tcp --dport %s -m comment --comment gofwdef-%s -j DROP`, r.FromPort, id))
 
 			run(fmt.Sprintf(`iptables -I FORWARD -m conntrack --ctstate INVALID -d %s --dport %s -m comment --comment gofwdef-%s -j DROP`, r.ToIP, r.ToPort, id))
@@ -168,7 +196,6 @@ func applySeenTracking(r Rule) {
 }
 
 func applyRule(r Rule){ applyWhitelistBypass(r); applyDefense(r); applyDNAT(r); applySeenTracking(r) }
-
 func removeRule(r Rule){
 	removeRuleSingle(r,"both")
 	_ = run(fmt.Sprintf("ipset destroy gofw_syn_%s 2>/dev/null || ipset flush gofw_syn_%s || true", r.ID, r.ID))
@@ -333,7 +360,24 @@ func main(){
 		w.Header().Set("Content-Type","application/json"); _=json.NewEncoder(w).Encode(map[string]any{"set":"gofw_white","count":len(ips),"ips":ips})
 	})
 
-	// connections (realtime, gộp SYN & EST)
+	// block all current (from ipsets), skip whitelist
+	mux.HandleFunc("/api/blockall", func(w http.ResponseWriter, r *http.Request){
+		mu.Lock(); local := make([]Rule,0,len(rules)); for _,ru := range rules { if ru.Active { local=append(local,ru) } }; mu.Unlock()
+		whites := map[string]bool{}
+		if out,err := exec.Command("ipset","list","gofw_white","-o","save").CombinedOutput(); err==nil {
+			for _,l := range strings.Split(string(out),"\n"){ f:=strings.Fields(l); if len(f)==3 && f[0]=="add" && f[1]=="gofw_white"{ whites[f[2]]=true } }
+		}
+		for _,ru := range local {
+			for _,set := range []string{"gofw_syn_"+ru.ID,"gofw_seen_"+ru.ID} {
+				if out,err := exec.Command("ipset","list",set,"-o","save").CombinedOutput(); err==nil {
+					for _,l := range strings.Split(string(out),"\n"){ f:=strings.Fields(l); if len(f)>=3 && f[0]=="add" && f[1]==set { ip:=f[2]; if !whites[ip]{ _=run(fmt.Sprintf("ipset add gofw_block %s -exist",ip)) } } }
+				}
+			}
+		}
+		w.WriteHeader(204)
+	})
+
+	// realtime connections (EST & SYN per rule)
 	mux.HandleFunc("/api/connections", func(w http.ResponseWriter, r *http.Request){
 		type Conn struct {
 			IP string `json:"ip"`
@@ -347,10 +391,12 @@ func main(){
 		out := []Conn{}
 		mu.Lock(); local := make([]Rule,0,len(rules)); for _,ru := range rules { if ru.Active { local=append(local,ru) } }; mu.Unlock()
 		for _, ru := range local {
-			seen, _ := readIPSetCounts("gofw_seen_"+ru.ID)
-			for _, e := range seen { out = append(out, Conn{IP:e.IP, Phase:"EST", FromPort:ru.FromPort, ToIP:ru.ToIP, ToPort:ru.ToPort, RuleID:ru.ID, Count:e.Pkts}) }
-			syns, _ := readIPSetCounts("gofw_syn_"+ru.ID)
-			for _, e := range syns { out = append(out, Conn{IP:e.IP, Phase:"SYN", FromPort:ru.FromPort, ToIP:ru.ToIP, ToPort:ru.ToPort, RuleID:ru.ID, Count:e.Pkts}) }
+			if seen,err := readIPSetCounts("gofw_seen_"+ru.ID); err==nil {
+				for _, e := range seen { out = append(out, Conn{IP:e.IP, Phase:"EST", FromPort:ru.FromPort, ToIP:ru.ToIP, ToPort:ru.ToPort, RuleID:ru.ID, Count:e.Pkts}) }
+			}
+			if syns,err := readIPSetCounts("gofw_syn_"+ru.ID); err==nil {
+				for _, e := range syns { out = append(out, Conn{IP:e.IP, Phase:"SYN", FromPort:ru.FromPort, ToIP:ru.ToIP, ToPort:ru.ToPort, RuleID:ru.ID, Count:e.Pkts}) }
+			}
 		}
 		w.Header().Set("Content-Type","application/json"); _=json.NewEncoder(w).Encode(out)
 	})
@@ -360,7 +406,7 @@ func main(){
 }
 GO
 
-# --- frontend (Vue CDN, 1 bảng trực quan) ---
+echo "==> Frontend (Vue CDN, UI đẹp/mượt)"
 cat > "$APP_DIR/backend/public/index.html" <<'HTML'
 <!DOCTYPE html>
 <html lang="vi">
@@ -382,6 +428,7 @@ cat > "$APP_DIR/backend/public/index.html" <<'HTML'
     .btn-grad:hover{opacity:.96;color:#fff}
     .muted{color:#6b7280}
     .chip{display:inline-flex;align-items:center;gap:.4rem;padding:.15rem .55rem;border-radius:999px;font-size:.75rem}
+    thead th{position:sticky;top:0;background:#fff;z-index:1}
   </style>
 </head>
 <body>
@@ -401,7 +448,7 @@ cat > "$APP_DIR/backend/public/index.html" <<'HTML'
 
     <div v-if="toast" class="alert" :class="toast.cls">{{ toast.msg }}</div>
 
-    <!-- Rules create -->
+    <!-- Create -->
     <div v-show="tab==='rules'" class="glass p-4 mb-4">
       <form @submit.prevent="createRule" class="row g-3 align-items-end">
         <div class="col-md-2">
@@ -434,7 +481,7 @@ cat > "$APP_DIR/backend/public/index.html" <<'HTML'
         <h5 class="mb-0">Danh sách DNAT</h5>
         <button class="btn btn-outline-primary pill btn-sm" @click="fetchRules"><i class="bi bi-arrow-clockwise"></i> Refresh</button>
       </div>
-      <div class="table-responsive">
+      <div class="table-responsive" style="max-height:420px">
         <table class="table align-middle">
           <thead class="table-light"><tr>
             <th>Proto</th><th>FromPort</th><th>Đích</th><th>Thêm lúc</th><th>Trạng thái</th><th>Hành động</th>
@@ -458,20 +505,23 @@ cat > "$APP_DIR/backend/public/index.html" <<'HTML'
       </div>
     </div>
 
-    <!-- Lists (1 bảng trực quan) -->
+    <!-- Realtime -->
     <div v-show="tab==='lists'" class="glass p-4">
       <div class="d-flex justify-content-between align-items-center mb-3">
         <h5 class="mb-0">Danh sách IP realtime</h5>
-        <button class="btn btn-outline-secondary btn-sm pill" @click="loadLists"><i class="bi bi-arrow-clockwise"></i> Refresh</button>
+        <div class="d-flex gap-2">
+          <input v-model="q" class="form-control form-control-sm pill" placeholder="Tìm IP/port..." style="max-width:220px">
+          <button class="btn btn-outline-secondary btn-sm pill" @click="loadLists"><i class="bi bi-arrow-clockwise"></i> Refresh</button>
+        </div>
       </div>
-      <div class="table-responsive">
+      <div class="table-responsive" style="max-height:520px">
         <table class="table table-hover align-middle">
           <thead class="table-light">
             <tr><th>IP đang kết nối</th><th>Phase</th><th>FromPort</th><th>IP:PORT chuyển tiếp</th><th>Rule</th><th>Packets</th><th class="text-end">Actions</th></tr>
           </thead>
           <tbody>
-            <tr v-if="rows.length===0"><td colspan="7" class="text-center muted">Chưa có kết nối trùng rule</td></tr>
-            <tr v-for="r in rows" :key="r.rule+'-'+r.phase+'-'+r.ip+'-'+r.toPort">
+            <tr v-if="rowsF.length===0"><td colspan="7" class="text-center muted">Chưa có kết nối trùng rule</td></tr>
+            <tr v-for="r in rowsF" :key="r.rule+'-'+r.phase+'-'+r.ip+'-'+r.toPort">
               <td class="fw-semibold">{{ r.ip }}</td>
               <td><span class="chip" :class="r.phase==='EST'?'bg-success text-white':'bg-warning'">{{ r.phase }}</span></td>
               <td>{{ r.fromPort }}</td>
@@ -541,6 +591,7 @@ cat > "$APP_DIR/backend/public/index.html" <<'HTML'
         <div class="col-md-6"><label class="form-label">UDP Burst</label><input type="number" min="100" v-model.number="cfg.udpBurst" class="form-control pill" :disabled="!cfg.ddosDefense"></div>
       </div>
       <div class="text-end mt-3"><button class="btn btn-grad pill" @click="saveCfg"><i class="bi bi-save"></i> Lưu & Áp dụng</button></div>
+      <div class="small muted mt-2">Whitelist được bỏ qua mọi hạn chế.</div>
     </div>
 
     <!-- Modal edit -->
@@ -573,11 +624,12 @@ cat > "$APP_DIR/backend/public/index.html" <<'HTML'
         const tab = ref('lists'), rules = ref([]), toast = ref(null), editing = ref(null)
         const form = ref({ proto:'tcp', fromPort:'', toIp:'', toPort:'' })
         const rows = ref([]), blocked = ref([]), white = ref([])
-        const blkIp = ref(""), wIp = ref("")
+        const blkIp = ref(""), wIp = ref(""), q = ref("")
         const cfg = ref({ ddosDefense:true, tcpSynPerIp:150, tcpSynBurst:300, tcpConnPerIp:250, udpPpsPerIp:8000, udpBurst:12000 })
         const fmt = t => t? new Date(t).toLocaleString('vi'):''
         const flash = (m,cls='alert-success') => { toast.value={msg:m,cls}; setTimeout(()=>toast.value=null,1600) }
         const go = t => { tab.value=t; if(t==='rules') fetchRules(); if(t==='lists') loadLists(); if(t==='blocked'){loadBlock()} if(t==='whitelist'){loadWhite()} if(t==='rate'){loadCfg()} }
+        const rowsF = computed(()=> rows.value.filter(x => !q.value || JSON.stringify(x).toLowerCase().includes(q.value.toLowerCase())) )
 
         const fetchRules = async()=>{ rules.value = await (await fetch('/api/rules')).json() }
         const createRule = async()=>{
@@ -610,14 +662,11 @@ cat > "$APP_DIR/backend/public/index.html" <<'HTML'
         const loadCfg = async()=>{ cfg.value = await (await fetch('/api/config')).json() }
         const saveCfg = async()=>{ const r = await fetch('/api/config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg.value)}); flash(r.ok?'Đã áp dụng':'Lưu lỗi','alert-'+(r.ok?'success':'danger')) }
 
-        const loadConn = async()=>{
-          const all = await (await fetch('/api/connections')).json()
-          rows.value = all
-        }
+        const loadConn = async()=>{ rows.value = await (await fetch('/api/connections')).json() }
         const loadLists = async()=>{ await Promise.all([loadConn(), loadBlock(), loadWhite()]) }
 
         onMounted(()=>{ fetchRules(); loadCfg(); loadLists(); setInterval(()=>{ if(tab.value==='lists'){ loadLists() } }, 1000) })
-        return {tab,go,fmt,toast,form,rules,createRule,toggleRule,del,edit,editing,saveEdit,rows,blocked,white,blkIp,wIp,blockIP,unblockIP,whiteIP,unwhiteIP,cfg,saveCfg,loadLists}
+        return {tab,go,fmt,toast,form,rules,createRule,toggleRule,del,edit,editing,saveEdit,rows,rowsF,blocked,white,blkIp,wIp,blockIP,unblockIP,whiteIP,unwhiteIP,cfg,saveCfg,loadLists,q}
       }
     }).mount('#app')
   </script>
@@ -625,7 +674,7 @@ cat > "$APP_DIR/backend/public/index.html" <<'HTML'
 </html>
 HTML
 
-# --- build & service ---
+echo "==> Build & service"
 cd "$APP_DIR/backend"
 [ -f rules.json ] || { echo "[]" > rules.json; chmod 666 rules.json; }
 [ -f config.json ] || { cat > config.json <<JSON
@@ -664,6 +713,8 @@ systemctl restart ifw.service
 
 IP=$(curl -s4 https://api.ipify.org || hostname -I | awk '{print $1}')
 echo
-echo "==> DONE"
+echo "==> HOÀN TẤT!"
 echo "Panel:  http://$IP:$PANEL_PORT/adminsetupfw/"
-PATCH
+echo "API:    /api/rules, /api/blocked, /api/whitelisted, /api/connections, /api/block, /api/whitelist"
+echo "Gợi ý:  tạo ít nhất 1 Rule, sang 'Danh sách IP' để xem realtime + block/whitelist."
+IFW_SCRIPT
