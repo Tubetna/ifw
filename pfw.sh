@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# IFW DNAT Panel – v3 (fixed, realtime IP OK)
+# IFW DNAT Panel – v3 (fixed, trailing-slash & realtime)
 # Usage:
 #   bash ifw_v3.sh 2020
-#   bash ifw_v3.sh 2020 80 103.252.136.208 80   # auto-create rule: 80 -> 103.252.136.208:80 (tcp)
+#   bash ifw_v3.sh 2020 80 103.252.136.208 80
 
 set -euo pipefail
 PANEL_PORT="${1:-2020}"
@@ -12,7 +12,6 @@ AUTO_TO_PORT="${4:-}"
 APP_DIR="/opt/ifw"
 GO_VERSION="1.22.4"
 export DEBIAN_FRONTEND=noninteractive
-
 [ "$(id -u)" -eq 0 ] || { echo "Please run as root"; exit 1; }
 log(){ echo -e "\e[36m==>\e[0m $*"; }
 
@@ -66,20 +65,13 @@ sysctl --system >/dev/null || true
 log "Base iptables/ipset"
 ipset create gofw_block hash:ip family inet maxelem 200000 -exist
 ipset create gofw_white hash:ip family inet maxelem 100000 -exist
-
-# Drop blocked IPs early & drop INVALID
 iptables -t raw -C PREROUTING -m set --match-set gofw_block src -j DROP 2>/dev/null || \
 iptables -t raw -I PREROUTING -m set --match-set gofw_block src -j DROP
 iptables -t mangle -C PREROUTING -m conntrack --ctstate INVALID -j DROP 2>/dev/null || \
 iptables -t mangle -I PREROUTING -m conntrack --ctstate INVALID -j DROP
-
-# Always allow established forwards
 iptables -C FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
 iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-
-# Make sure panel is reachable
 iptables -I INPUT -p tcp --dport "$PANEL_PORT" -j ACCEPT || true
-
 iptables-save > /etc/iptables/rules.v4 || true
 ipset save > /etc/ipset/rules.v4 || true
 netfilter-persistent save || true
@@ -163,7 +155,6 @@ func run(cmd string) error {
 	if err != nil { log.Printf("[ERR] %s => %s", cmd, out) }
 	return err
 }
-
 func protoMap(p string) []string {
 	switch strings.ToLower(p) {
 	case "both", "all": return []string{"tcp", "udp"}
@@ -205,7 +196,6 @@ func applyDefense(r Rule) {
 			_ = run(fmt.Sprintf(`iptables -I FORWARD -p udp -d %s --dport %s -m conntrack --ctstate NEW -m hashlimit --hashlimit-above %d/second --hashlimit-burst %d --hashlimit-mode srcip --hashlimit-name udpf-%s -m comment --comment gofwdef-%s -j DROP`, r.ToIP, r.ToPort, cfg.UdpPpsPerIp, cfg.UdpBurst, id, id))
 		}
 	}
-	// ensure established rule
 	if err := exec.Command("iptables", "-C", "FORWARD", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT").Run(); err != nil {
 		_ = run("iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT")
 	}
@@ -291,6 +281,58 @@ func readIPSetCounts(name string) ([]ipCount, error) {
 	return res, nil
 }
 
+// === Config handler: GET + PUT/POST, chịu trailing slash & prefix
+func configHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET,PUT,POST,OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(cfg)
+		return
+	case http.MethodPut, http.MethodPost:
+		var in Config
+		dec := json.NewDecoder(r.Body)
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&in); err != nil {
+			http.Error(w, "invalid json: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		old := cfg
+		cfg = in
+		if err := saveConfigAtomic(configFile, cfg); err != nil {
+			mu.Unlock()
+			http.Error(w, "write failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		mu.Unlock()
+		if old.DDOSDefense != cfg.DDOSDefense ||
+			old.TcpSynPerIp != cfg.TcpSynPerIp ||
+			old.TcpSynBurst != cfg.TcpSynBurst ||
+			old.TcpConnPerIp != cfg.TcpConnPerIp ||
+			old.UdpPpsPerIp != cfg.UdpPpsPerIp ||
+			old.UdpBurst != cfg.UdpBurst {
+			mu.Lock()
+			local := make([]Rule, 0, len(rules))
+			for _, ru := range rules { if ru.Active { local = append(local, ru) } }
+			mu.Unlock()
+			for _, ru := range local { removeRuleSingle(ru); applyRule(ru) }
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+		return
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+}
+
 func main() {
 	var port int
 	flag.IntVar(&port, "port", 2020, "Port for admin panel")
@@ -370,7 +412,6 @@ func main() {
 
 	// blocklist & whitelist
 	type ipReq struct{ IP string `json:"ip"` }
-
 	mux.HandleFunc("/api/block", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" { http.Error(w, "Method not allowed", 405); return }
 		var in ipReq; b, _ := io.ReadAll(r.Body)
@@ -395,7 +436,6 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"set": "gofw_block", "count": len(ips), "ips": ips})
 	})
-
 	mux.HandleFunc("/api/whitelist", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" { http.Error(w, "Method not allowed", 405); return }
 		var in ipReq; b, _ := io.ReadAll(r.Body)
@@ -427,7 +467,6 @@ func main() {
 		local := make([]Rule, 0, len(rules))
 		for _, ru := range rules { if ru.Active { local = append(local, ru) } }
 		mu.Unlock()
-
 		whites := map[string]bool{}
 		if out, err := exec.Command("ipset", "list", "gofw_white", "-o", "save").CombinedOutput(); err == nil {
 			for _, l := range strings.Split(string(out), "\n") {
@@ -450,7 +489,7 @@ func main() {
 		w.WriteHeader(204)
 	})
 
-	// Realtime connections (JSON key fix)
+	// Realtime connections
 	mux.HandleFunc("/api/connections", func(w http.ResponseWriter, r *http.Request) {
 		outRows := []Conn{}
 		mu.Lock()
@@ -472,6 +511,12 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(outRows)
 	})
+
+	// Config routes (chịu mọi biến thể)
+	mux.HandleFunc("/api/config", configHandler)
+	mux.HandleFunc("/api/config/", configHandler)
+	mux.HandleFunc("/adminsetupfw/api/config", configHandler)
+	mux.HandleFunc("/adminsetupfw/api/config/", configHandler)
 
 	log.Printf("IFW DNAT Panel http://0.0.0.0:%d/adminsetupfw/\n", port)
 	_ = http.ListenAndServe(fmt.Sprintf("0.0.0.0:%d", port), mux)
@@ -732,14 +777,18 @@ cat > "$APP_DIR/backend/public/index.html" <<'HTML'
         const unwhiteIP = async(ip)=>{ const r=await fetch('/api/unwhitelist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip})}); flash(r.ok?'Removed':'Lỗi','alert-'+(r.ok?'success':'danger')); loadWhite(); loadLists() }
 
         const loadCfg = async()=>{ cfg.value = await (await fetch('/api/config')).json() }
-        // Lưu: đọc text để show lỗi cụ thể
+        // Fallback POST nếu proxy chặn PUT / hoặc path khác trả 404
         const saveCfg = async()=>{
           try{
-            const r = await fetch('/api/config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg.value)});
-            const txt = await r.text();
-            if(r.ok){ flash('Đã áp dụng'); }
-            else { flash('Lưu lỗi: '+(txt||('HTTP '+r.status)),'alert-danger'); }
-          }catch(e){ flash('Lưu lỗi: '+e,'alert-danger'); }
+            const body = JSON.stringify(cfg.value)
+            let r = await fetch('/api/config',{method:'PUT',headers:{'Content-Type':'application/json'},body})
+            if(r.status===404 || r.status===405){
+              r = await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body})
+            }
+            const txt = await r.text()
+            if(r.ok){ flash('Đã áp dụng') }
+            else { flash('Lưu lỗi: '+(txt||('HTTP '+r.status)),'alert-danger') }
+          }catch(e){ flash('Lưu lỗi: '+e,'alert-danger') }
         }
 
         const loadConn = async()=>{ rows.value = await (await fetch('/api/connections')).json() }
@@ -791,7 +840,7 @@ systemctl daemon-reload
 systemctl enable --now ifw.service >/dev/null
 systemctl restart ifw.service
 
-# Optional: auto-create a rule from CLI arguments (for quick testing)
+# Optional: auto-create a rule from CLI arguments
 if [[ -n "$AUTO_FROM" && -n "$AUTO_TO_IP" && -n "$AUTO_TO_PORT" ]]; then
   log "Auto-create rule: $AUTO_FROM -> $AUTO_TO_IP:$AUTO_TO_PORT (tcp)"
   curl -sS -X POST -H 'Content-Type: application/json' \
@@ -804,11 +853,10 @@ cat <<MSG
 
 ==> DONE!
 Panel:  http://$PUB_IP:$PANEL_PORT/adminsetupfw/
-Tip:   Tạo rule From=80 -> To=103.252.136.208:80 rồi bắn traffic test.
 
 QUICK DEBUG:
-  1) Mở inbound trên Security Group của VPS (port bạn forward, VD: 80).
-  2) Kiểm tra DNAT: iptables -t nat -S PREROUTING | grep -- '--dport 80'
-  3) Bắt gói: tcpdump -n -i any 'tcp and port 80'
-  4) rp_filter đã tắt trong /etc/sysctl.d/99-ifw-dnat.conf
+  1) Mở inbound trên Security Group (port bạn forward).
+  2) DNAT:  iptables -t nat -S PREROUTING | grep -- '--dport <PORT>'
+  3) Bắt gói: tcpdump -n -i any 'tcp and port <PORT>'
+  4) rp_filter đã tắt: /etc/sysctl.d/99-ifw-dnat.conf
 MSG
