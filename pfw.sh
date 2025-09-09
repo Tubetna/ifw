@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# IFW DNAT Panel – v3 (fixed, trailing-slash & realtime)
+# IFW DNAT Panel – v3 (fixed, trailing-slash, realtime, AUTOBLOCK)
 # Usage:
 #   bash ifw_v3.sh 2020
 #   bash ifw_v3.sh 2020 80 103.252.136.208 80
@@ -20,7 +20,7 @@ mkdir -p "$APP_DIR/backend/public" /etc/ipset /etc/iptables
 
 log "Install deps"
 apt-get update -y >/dev/null
-apt-get install -y curl ca-certificates build-essential iptables iptables-persistent netfilter-persistent ipset conntrack jq >/dev/null
+apt-get install -y curl ca-certificates build-essential iptables iptables-persistent netfilter-persistent ipset ipset-persistent conntrack jq >/dev/null || true
 
 if ! command -v go >/dev/null 2>&1; then
   log "Install Go $GO_VERSION"
@@ -79,6 +79,7 @@ netfilter-persistent save || true
 log "Backend"
 cat > "$APP_DIR/backend/go.mod" <<'GOMOD'
 module ifw
+
 go 1.22
 GOMOD
 
@@ -166,7 +167,7 @@ func removeRuleSingle(r Rule) {
 	for _, table := range []string{"raw", "mangle", "nat", "filter"} {
 		out, _ := exec.Command("iptables-save", "-t", table).Output()
 		for _, l := range strings.Split(string(out), "\n") {
-			if strings.Contains(l, "gofw-"+r.ID) || strings.Contains(l, "gofwdef-"+r.ID) || strings.Contains(l, "gofwwhite-"+r.ID) || strings.Contains(l, "gofwseen-"+r.ID) {
+			if strings.Contains(l, "gofw-"+r.ID) || strings.Contains(l, "gofwdef-"+r.ID) || strings.Contains(l, "gofwwhite-"+r.ID) || strings.Contains(l, "gofwseen-"+r.ID) || strings.Contains(l, "gofwauto-"+r.ID) {
 				line := l
 				if strings.HasPrefix(line, "-A") { line = strings.Replace(line, "-A", "-D", 1) }
 				_ = run(fmt.Sprintf("iptables -t %s %s", table, line))
@@ -188,14 +189,56 @@ func applyDefense(r Rule) {
 	if !cfg.DDOSDefense { return }
 	id := r.ID
 	for _, p := range protoMap(r.Proto) {
-		if p == "tcp" {
-			_ = run(fmt.Sprintf(`iptables -I FORWARD -p tcp -d %s --dport %s --syn -m hashlimit --hashlimit-above %d/second --hashlimit-burst %d --hashlimit-mode srcip --hashlimit-name syn-%s -m comment --comment gofwdef-%s -j DROP`, r.ToIP, r.ToPort, cfg.TcpSynPerIp, cfg.TcpSynBurst, id, id))
-			_ = run(fmt.Sprintf(`iptables -I FORWARD -p tcp -d %s --dport %s -m connlimit --connlimit-above %d --connlimit-mask 32 -m comment --comment gofwdef-%s -j DROP`, r.ToIP, r.ToPort, cfg.TcpConnPerIp, id))
-		}
-		if p == "udp" {
-			_ = run(fmt.Sprintf(`iptables -I FORWARD -p udp -d %s --dport %s -m conntrack --ctstate NEW -m hashlimit --hashlimit-above %d/second --hashlimit-burst %d --hashlimit-mode srcip --hashlimit-name udpf-%s -m comment --comment gofwdef-%s -j DROP`, r.ToIP, r.ToPort, cfg.UdpPpsPerIp, cfg.UdpBurst, id, id))
+		switch p {
+		case "tcp":
+			// TCP SYN rate — DROP (đặt trước)
+			_ = run(fmt.Sprintf(
+				`iptables -I FORWARD -p tcp -d %s --dport %s --syn -m set ! --match-set gofw_white src `+
+					`-m hashlimit --hashlimit-above %d/second --hashlimit-burst %d --hashlimit-mode srcip --hashlimit-name syn-%s `+
+					`-m comment --comment gofwdef-%s -j DROP`,
+				r.ToIP, r.ToPort, cfg.TcpSynPerIp, cfg.TcpSynBurst, id, id))
+
+			// TCP SYN rate — AUTOBLOCK (chèn lên trên DROP)
+			_ = run(fmt.Sprintf(
+				`iptables -I FORWARD -p tcp -d %s --dport %s --syn -m set ! --match-set gofw_white src `+
+					`-m hashlimit --hashlimit-above %d/second --hashlimit-burst %d --hashlimit-mode srcip --hashlimit-name syn-%s `+
+					`-m comment --comment gofwauto-%s -j SET --add-set gofw_block src`,
+				r.ToIP, r.ToPort, cfg.TcpSynPerIp, cfg.TcpSynBurst, id, id))
+
+			// TCP concurrent connections — DROP
+			_ = run(fmt.Sprintf(
+				`iptables -I FORWARD -p tcp -d %s --dport %s -m set ! --match-set gofw_white src `+
+					`-m connlimit --connlimit-above %d --connlimit-mask 32 `+
+					`-m comment --comment gofwdef-%s -j DROP`,
+				r.ToIP, r.ToPort, cfg.TcpConnPerIp, id))
+
+			// TCP concurrent connections — AUTOBLOCK (chèn lên trên DROP)
+			_ = run(fmt.Sprintf(
+				`iptables -I FORWARD -p tcp -d %s --dport %s -m set ! --match-set gofw_white src `+
+					`-m connlimit --connlimit-above %d --connlimit-mask 32 `+
+					`-m comment --comment gofwauto-%s -j SET --add-set gofw_block src`,
+				r.ToIP, r.ToPort, cfg.TcpConnPerIp, id))
+
+		case "udp":
+			// UDP NEW pps — DROP
+			_ = run(fmt.Sprintf(
+				`iptables -I FORWARD -p udp -d %s --dport %s -m set ! --match-set gofw_white src `+
+					`-m conntrack --ctstate NEW `+
+					`-m hashlimit --hashlimit-above %d/second --hashlimit-burst %d --hashlimit-mode srcip --hashlimit-name udpf-%s `+
+					`-m comment --comment gofwdef-%s -j DROP`,
+				r.ToIP, r.ToPort, cfg.UdpPpsPerIp, cfg.UdpBurst, id, id))
+
+			// UDP NEW pps — AUTOBLOCK (chèn lên trên DROP)
+			_ = run(fmt.Sprintf(
+				`iptables -I FORWARD -p udp -d %s --dport %s -m set ! --match-set gofw_white src `+
+					`-m conntrack --ctstate NEW `+
+					`-m hashlimit --hashlimit-above %d/second --hashlimit-burst %d --hashlimit-mode srcip --hashlimit-name udpf-%s `+
+					`-m comment --comment gofwauto-%s -j SET --add-set gofw_block src`,
+				r.ToIP, r.ToPort, cfg.UdpPpsPerIp, cfg.UdpBurst, id, id))
 		}
 	}
+
+	// keep state
 	if err := exec.Command("iptables", "-C", "FORWARD", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT").Run(); err != nil {
 		_ = run("iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT")
 	}
@@ -552,7 +595,7 @@ cat > "$APP_DIR/backend/public/index.html" <<'HTML'
   <div id="app" class="container py-5" style="max-width:1180px">
     <div class="text-center mb-4">
       <h1 class="hero fw-800">IFW DNAT Panel</h1>
-      <div class="muted">Kernel DNAT • hashlimit/connlimit • raw-drop • Whitelist bypass</div>
+      <div class="muted">Kernel DNAT • hashlimit/connlimit • raw-drop • Whitelist bypass • <b>AUTOBLOCK</b></div>
     </div>
 
     <ul class="nav nav-pills justify-content-center gap-2 mb-4">
@@ -708,7 +751,7 @@ cat > "$APP_DIR/backend/public/index.html" <<'HTML'
         <div class="col-md-6"><label class="form-label">UDP Burst</label><input type="number" min="100" v-model.number="cfg.udpBurst" class="form-control pill" :disabled="!cfg.ddosDefense"></div>
       </div>
       <div class="text-end mt-3"><button class="btn btn-grad pill" @click="saveCfg"><i class="bi bi-save"></i> Lưu & Áp dụng</button></div>
-      <div class="small muted mt-2">Whitelist được bỏ qua mọi hạn chế.</div>
+      <div class="small muted mt-2">Whitelist được bỏ qua mọi hạn chế. AUTOBLOCK sẽ thêm IP vi phạm vào blocklist.</div>
     </div>
 
     <!-- Modal edit -->
@@ -777,14 +820,11 @@ cat > "$APP_DIR/backend/public/index.html" <<'HTML'
         const unwhiteIP = async(ip)=>{ const r=await fetch('/api/unwhitelist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip})}); flash(r.ok?'Removed':'Lỗi','alert-'+(r.ok?'success':'danger')); loadWhite(); loadLists() }
 
         const loadCfg = async()=>{ cfg.value = await (await fetch('/api/config')).json() }
-        // Fallback POST nếu proxy chặn PUT / hoặc path khác trả 404
         const saveCfg = async()=>{
           try{
             const body = JSON.stringify(cfg.value)
             let r = await fetch('/api/config',{method:'PUT',headers:{'Content-Type':'application/json'},body})
-            if(r.status===404 || r.status===405){
-              r = await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body})
-            }
+            if(r.status===404 || r.status===405){ r = await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body}) }
             const txt = await r.text()
             if(r.ok){ flash('Đã áp dụng') }
             else { flash('Lưu lỗi: '+(txt||('HTTP '+r.status)),'alert-danger') }
@@ -859,4 +899,5 @@ QUICK DEBUG:
   2) DNAT:  iptables -t nat -S PREROUTING | grep -- '--dport <PORT>'
   3) Bắt gói: tcpdump -n -i any 'tcp and port <PORT>'
   4) rp_filter đã tắt: /etc/sysctl.d/99-ifw-dnat.conf
+  5) Bật chống DDoS ở tab Rate (hoặc set Environment=DDOS_DEFENSE=1) để kích hoạt AUTOBLOCK.
 MSG
